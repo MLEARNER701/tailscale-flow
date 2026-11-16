@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.tmp
+# your own recordings contain machine names: keep them out of the repo
+*-trace.json
+!demo/synthetic-trace.json
+my-flow.html

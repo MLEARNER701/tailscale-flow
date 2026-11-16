@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests (offline)
+        run: python3 -m unittest discover -s tests -v
+      - name: Demo trace is reproducible
+        run: |
+          python3 tools/make_synthetic_trace.py --out /tmp/demo.json
+          cmp /tmp/demo.json demo/synthetic-trace.json

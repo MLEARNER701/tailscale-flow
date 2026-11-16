@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>tailscale-flow</title>
+<meta name="description" content="Replay or watch live Tailscale traffic between this machine and one peer: direction, bandwidth, packets, round-trip time and DERP vs direct path, from the tailscale CLI only.">
+<style>
+/* Layout: one instrument column. The link stage leads, live readouts sit under it, then three time strips on one shared clock.
+   Light and dark palettes; set data-theme="light" or "dark" on <html> to force one. */
+:root{
+  --bg:#ffffff; --surface:#f7f8fa; --raised:#f2f2f2;
+  --ink:#141414; --muted:#555b64; --faint:#6f757e;
+  --line:#e5e7eb; --line-strong:#cdd1d8; --control:#7f7f7f; --grid:#eceef1;
+  --accent:#1557ff; --accent-soft:#eef3ff;
+  --ok:#147553; --warn:#9a5800; --bad:#b42318;
+  --up:#414fbb;   /* sent: this machine -> peer */
+  --down:#d9704f; /* received: peer -> this machine */
+  --rtt:#069fa6;  /* round trip */
+  --font-sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","Apple SD Gothic Neo","Noto Sans KR",system-ui,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0d0d0d; --surface:#141414; --raised:#1e1e1e;
+    --ink:#f3f5f7; --muted:#b8bdc7; --faint:#9ca3ad;
+    --line:#333840; --line-strong:#4a505b; --control:#7f7f7f; --grid:#22262d;
+    --accent:#7aa2ff; --accent-soft:#18213a;
+    --ok:#8dd8b2; --warn:#f0cd37; --bad:#ffb4aa;
+    --up:#5364d3; --down:#cf6746; --rtt:#15a8ae;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0d0d0d; --surface:#141414; --raised:#1e1e1e;
+  --ink:#f3f5f7; --muted:#b8bdc7; --faint:#9ca3ad;
+  --line:#333840; --line-strong:#4a505b; --control:#7f7f7f; --grid:#22262d;
+  --accent:#7aa2ff; --accent-soft:#18213a;
+  --ok:#8dd8b2; --warn:#f0cd37; --bad:#ffb4aa;
+  --up:#5364d3; --down:#cf6746; --rtt:#15a8ae;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{overflow-x:clip}
+body{background:var(--bg);color:var(--ink);font:400 15px/1.6 var(--font-sans);letter-spacing:-0.006em;word-break:keep-all;overflow-wrap:break-word}
+.wrap{max-width:1180px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 56px;display:grid;gap:20px}
+.wrap>*{min-width:0}
+h1,h2{text-wrap:balance;margin:0}
+h1{font:550 clamp(1.5rem,3.6vw,2.125rem)/1.18 var(--font-sans);letter-spacing:-0.034em}
+h2{font:550 0.9375rem/1.4 var(--font-sans);letter-spacing:-0.01em}
+p{margin:0;max-width:72ch}
+.eyebrow{font:600 0.6875rem/1.2 var(--font-sans);letter-spacing:0.085em;text-transform:uppercase;color:var(--muted)}
+.mono{font-family:var(--font-mono)}
+.muted{color:var(--muted)}
+.num{font-variant-numeric:tabular-nums}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+button{font:inherit;color:inherit;cursor:pointer}
+code{font:0.8125rem/1.5 var(--font-mono);background:var(--raised);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+
+/* header */
+header.top{display:grid;gap:8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:2px 10px;border:1px solid var(--line);border-radius:999px;font:500 0.8125rem/1.3 var(--font-sans);color:var(--muted);background:var(--bg);white-space:nowrap}
+.chip b{font-weight:600;color:var(--ink)}
+.chip i{width:8px;height:8px;border-radius:999px;background:currentColor;flex:none}
+.chip.ok{color:var(--ok)}.chip.warn{color:var(--warn)}.chip.bad{color:var(--bad)}
+.chip.warn i{border-radius:1px;transform:rotate(45deg) scale(.9)}
+.chip.bad i{border-radius:1px}
+.chip.ok b,.chip.warn b,.chip.bad b{color:inherit}
+.summary{display:flex;flex-wrap:wrap;gap:4px 18px;font:400 0.8125rem/1.6 var(--font-sans);color:var(--muted)}
+.summary span{white-space:nowrap}
+.summary b{color:var(--ink);font-weight:600}
+.banner{border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-size:0.8125rem;color:var(--muted);background:var(--surface)}
+.banner.bad{color:var(--bad);border-color:currentColor}
+
+/* controls */
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}
+.btn-play{display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:0 16px 0 12px;border:1px solid var(--ink);border-radius:8px;background:var(--ink);color:var(--bg);font:600 0.875rem/1 var(--font-sans)}
+.btn-play:hover{opacity:.88}
+.btn-play svg{width:16px;height:16px;fill:currentColor}
+.seg{display:inline-flex;border:1px solid var(--control);border-radius:6px;overflow:hidden;max-width:100%}
+.seg button{min-height:44px;min-width:44px;padding:0 10px;border:0;border-right:1px solid var(--line);background:var(--bg);color:var(--muted);font:550 0.8125rem/1 var(--font-sans);font-variant-numeric:tabular-nums}
+.seg button:last-child{border-right:0}
+.seg button:hover{background:var(--surface);color:var(--ink)}
+.seg button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent)}
+.seg button:disabled{opacity:.45;cursor:not-allowed}
+.scrub{display:flex;align-items:center;gap:10px;flex:1 1 220px;min-width:0}
+.scrub input{flex:1;min-width:0;accent-color:var(--accent);height:44px}
+.clock{font:500 0.8125rem/1.2 var(--font-mono);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.ctl-label{font:500 0.75rem/1 var(--font-sans);color:var(--muted)}
+.ctl-group{display:inline-flex;align-items:center;gap:8px}
+
+/* stage */
+.stage{border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:6px 6px 0}
+.stage canvas{display:block;width:100%;height:260px}
+.key{display:flex;flex-wrap:wrap;gap:6px 16px;padding:8px 10px 10px;border-top:1px solid var(--line);font:400 0.75rem/1.5 var(--font-sans);color:var(--muted)}
+.key span{display:inline-flex;align-items:center;gap:6px}
+.lk{display:inline-block;width:14px;height:0;border-top:2px solid var(--c);border-radius:2px;flex:none}
+.lk.dot{width:8px;height:8px;border:0;border-radius:999px;background:var(--c)}
+.lk.ring{width:10px;height:10px;border:2px solid var(--c);border-radius:999px}
+.lk.band{width:14px;height:8px;border:0;border-radius:2px;background:color-mix(in oklab,var(--c) 22%,transparent)}
+.lk.x{width:auto;height:auto;border:0;color:var(--bad);font:700 12px/1 var(--font-mono)}
+.key .enc{color:var(--faint)}
+
+/* readouts */
+.tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.tile{display:grid;gap:4px;align-content:start;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--bg);min-width:0}
+.tile .lab{display:flex;align-items:center;gap:8px;font:550 0.8125rem/1.35 var(--font-sans);color:var(--muted)}
+.tile .val{font:600 1.75rem/1.15 var(--font-sans);letter-spacing:-0.02em;color:var(--ink);white-space:nowrap}
+.tile .val small{font:500 0.875rem/1 var(--font-sans);color:var(--muted);margin-left:4px;letter-spacing:0}
+.tile .sub{font:400 0.75rem/1.5 var(--font-sans);color:var(--muted);font-variant-numeric:tabular-nums}
+.tile .sub b{color:var(--ink);font-weight:600}
+@media (max-width:760px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:340px){.tiles{grid-template-columns:minmax(0,1fr)}}
+
+/* strips */
+.strips{position:relative;display:grid;gap:14px}
+.strip{display:grid;gap:4px}
+.strip-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 14px}
+.strip-head .unit{font:400 0.75rem/1 var(--font-sans);color:var(--muted);margin-left:6px}
+.strip-head .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font:400 0.75rem/1.4 var(--font-sans);color:var(--muted)}
+.strip-head .legend span{display:inline-flex;align-items:center;gap:6px}
+.strip canvas{display:block;width:100%;height:120px;touch-action:pan-y;border-radius:4px}
+.strip canvas:focus-visible{outline-offset:0}
+.tip{position:absolute;z-index:3;pointer-events:none;min-width:190px;max-width:260px;padding:8px 10px;border:1px solid var(--line-strong);border-radius:6px;background:var(--bg);box-shadow:0 4px 12px rgba(20,20,20,.10);font:400 0.75rem/1.5 var(--font-sans);color:var(--muted)}
+.tip .t{font:600 0.75rem/1.4 var(--font-mono);color:var(--ink);margin-bottom:4px}
+.tip .row{display:flex;align-items:center;gap:8px}
+.tip .row b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums;min-width:74px;text-align:right}
+
+/* details */
+details{border-top:1px solid var(--line);padding-top:12px}
+summary{cursor:pointer;min-height:32px;font:550 0.875rem/1.6 var(--font-sans)}
+.tablewrap{overflow-x:auto;max-height:420px;overflow-y:auto;margin-top:8px;border:1px solid var(--line);border-radius:6px}
+table{border-collapse:collapse;width:100%;font:400 0.75rem/1.4 var(--font-sans)}
+th,td{padding:5px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+th{position:sticky;top:0;background:var(--surface);color:var(--muted);font-weight:550}
+td:first-child,th:first-child{text-align:left;font-family:var(--font-mono)}
+.method{display:grid;gap:10px;margin-top:8px;font-size:0.875rem;line-height:1.65}
+.method ul{margin:0;padding-left:1.2em;display:grid;gap:6px}
+.tag{display:inline-block;font:600 0.6875rem/1.4 var(--font-sans);padding:0 6px;border-radius:4px;border:1px solid var(--line-strong);color:var(--muted);margin-right:4px;vertical-align:1px}
+footer{font:400 0.75rem/1.6 var(--font-sans);color:var(--faint);display:grid;gap:2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="eyebrow" id="eyebrow">Tailscale tunnel · 1-second trace replay</div>
+    <h1 id="title">this machine ↔ peer</h1>
+    <div class="chips" id="chips"></div>
+    <div class="summary" id="summary"></div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <div class="controls" role="group" aria-label="Playback controls">
+    <button class="btn-play" id="play" type="button" aria-pressed="true">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path id="playicon" d="M4 2.5h3v11H4zM9 2.5h3v11H9z"></path></svg>
+      <span id="playlabel">Pause</span>
+    </button>
+    <div class="ctl-group"><span class="ctl-label" id="speedlab">Speed</span>
+      <div class="seg" id="speed" role="group" aria-labelledby="speedlab">
+        <button type="button" data-v="0.5">0.5×</button><button type="button" data-v="1" aria-pressed="true">1×</button><button type="button" data-v="2">2×</button><button type="button" data-v="4">4×</button><button type="button" data-v="10">10×</button>
+      </div>
+    </div>
+    <div class="scrub"><input type="range" id="scrub" min="0" max="1000" step="1" value="0" aria-label="Playback position"><span class="clock" id="clock">--:--:--</span></div>
+    <div class="ctl-group"><span class="ctl-label" id="winlab">Chart range</span>
+      <div class="seg" id="win" role="group" aria-labelledby="winlab">
+        <button type="button" data-v="60" aria-pressed="true">60 s</button><button type="button" data-v="0">All</button>
+      </div>
+    </div>
+  </div>
+
+  <section class="stage" aria-label="Link animation">
+    <canvas id="link" role="img" aria-label="Traffic animation between this machine and the peer"></canvas>
+    <div class="key">
+      <span><i class="lk" style="--c:var(--up)"></i>sent (this machine → peer)</span>
+      <span><i class="lk" style="--c:var(--down)"></i>received (peer → this machine)</span>
+      <span><i class="lk ring" style="--c:var(--rtt)"></i>ping round trip (slowed down on screen)</span>
+      <span class="enc">Denser dots = more packets/s, faster dots = more bytes/s, bigger dots = larger average packets (all on log scales).</span>
+    </div>
+  </section>
+
+  <section class="tiles" aria-label="Current values">
+    <div class="tile">
+      <div class="lab"><i class="lk" style="--c:var(--up)"></i>Sent · this machine → peer</div>
+      <div class="val" id="v-up">—</div>
+      <div class="sub" id="s-up1">—</div>
+      <div class="sub" id="s-up2">—</div>
+    </div>
+    <div class="tile">
+      <div class="lab"><i class="lk" style="--c:var(--down)"></i>Received · peer → this machine</div>
+      <div class="val" id="v-down">—</div>
+      <div class="sub" id="s-down1">—</div>
+      <div class="sub" id="s-down2">—</div>
+    </div>
+    <div class="tile">
+      <div class="lab"><i class="lk ring" style="--c:var(--rtt)"></i>Round trip (ping)</div>
+      <div class="val" id="v-rtt">—</div>
+      <div class="sub" id="s-rtt1">—</div>
+      <div class="sub" id="s-rtt2">—</div>
+    </div>
+    <div class="tile">
+      <div class="lab">Path · connection</div>
+      <div class="val" id="v-path">—</div>
+      <div class="sub" id="s-path1">—</div>
+      <div class="sub" id="s-path2">—</div>
+    </div>
+  </section>
+
+  <section class="strips" id="strips" aria-label="Time series">
+    <div class="strip">
+      <div class="strip-head"><h2>Throughput<span class="unit">Mbps · this peer only</span></h2>
+        <div class="legend"><span><i class="lk" style="--c:var(--up)"></i>sent</span><span><i class="lk" style="--c:var(--down)"></i>received</span></div></div>
+      <canvas id="c-rate" tabindex="0" aria-label="Throughput chart. Left and right arrow keys move one second"></canvas>
+    </div>
+    <div class="strip">
+      <div class="strip-head"><h2>Packets<span class="unit">per second · Tailscale wire counters</span></h2>
+        <div class="legend"><span><i class="lk" style="--c:var(--up)"></i>sent</span><span><i class="lk" style="--c:var(--down)"></i>received</span></div></div>
+      <canvas id="c-pkt" tabindex="0" aria-label="Packet chart. Left and right arrow keys move one second"></canvas>
+    </div>
+    <div class="strip">
+      <div class="strip-head"><h2>Round-trip time<span class="unit">ms</span></h2>
+        <div class="legend"><span><i class="lk dot" style="--c:var(--rtt)"></i>one ping</span><span><i class="lk" style="--c:var(--rtt)"></i>SRTT</span><span><i class="lk band" style="--c:var(--rtt)"></i>±RTTVAR</span><span><i class="lk x">×</i>lost</span></div></div>
+      <canvas id="c-rtt" tabindex="0" aria-label="Round-trip chart. Left and right arrow keys move one second"></canvas>
+    </div>
+    <div class="tip" id="tip" hidden></div>
+  </section>
+
+  <details id="tabledet">
+    <summary>Per-second table</summary>
+    <div class="tablewrap"><table><thead><tr><th>Time (local)</th><th>Sent kbps</th><th>Received kbps</th><th>Sent pkt/s</th><th>Received pkt/s</th><th>utun out / in</th><th>Path</th><th>ping ms</th></tr></thead><tbody id="tbody"></tbody></table></div>
+  </details>
+
+  <details>
+    <summary>How it is measured, and the limits</summary>
+    <div class="method">
+      <ul>
+        <li><span class="tag">measured</span>Bytes: the peer's <code>RxBytes</code>/<code>TxBytes</code> from <code>tailscale status --json</code>, read every second; the rate is the difference over time. WireGuard bytes for this one peer only.</li>
+        <li><span class="tag">measured</span>Packets: <code>tailscaled_inbound/outbound_packets_total</code> from <code>tailscale metrics print</code> (summed over paths). These count every peer, so the page scales them by this peer's share of bytes in the same second (<code>orx</code>/<code>otx</code> are the other peers' bytes). Other peers' bytes during this trace: <span id="m-oth">—</span>.</li>
+        <li><span class="tag">measured</span>Packets on the OS tunnel interface (<code>netstat -ib</code>, utun) are shown in the table only. Traffic that tailscaled handles itself, such as <code>tailscale serve</code>, never crosses utun, so utun counts can be far below the peer byte counts.</li>
+        <li><span class="tag">measured</span>Round trip: <code>tailscale ping -c 1</code>, re-sent as soon as the previous answer arrives (at most once per <code>--ping-every</code>). SRTT and RTTVAR use the RFC 6298 constants (α 1/8, β 1/4); lost probes do not update the estimate.</li>
+        <li><span class="tag">measured</span>Path: if the peer has no <code>CurAddr</code> but has a <code>Relay</code>, traffic goes through a DERP relay; with a <code>CurAddr</code> it is a direct connection (LAN or WAN). The <code>via</code> of each ping answer is recorded too.</li>
+        <li><span class="tag">inferred</span>Over DERP, packets go to the receiver's home DERP region. So "sent" is drawn through the peer's home (<span class="hd-peer">—</span>) and "received" through this machine's home (<span class="hd-self">—</span>). The reverse direction is not observed directly.</li>
+        <li><span class="tag">design</span>Dot density, speed and size are log-scaled metaphors: one dot is not exactly one packet. Dots move in real time; the playback speed only changes how fast the values change.</li>
+        <li>Public IPs and tailnet IPs are never recorded. A direct endpoint is reduced to LAN or WAN.</li>
+      </ul>
+    </div>
+  </details>
+
+  <footer>
+    <span id="foot-src">—</span>
+    <span>Collector: <code>flow_collector.py</code> (read-only, Python standard library only). For live data run <code>flow_collector.py serve</code> and open this page with <code>?src=</code> pointing at its <code>flow.json</code>.</span>
+  </footer>
+</div>
+<script type="application/json" id="trace">{"schema":"tsflow.v1","mode":"trace","synthetic":true,"generated_at":1767268981.0,"every_s":1.0,"ping_every_s":1.0,"meta":{"backend_state":"Running","tailscale_version":null,"self":{"name":"desk","os":"macOS","home_derp":"ams","form":"desktop"},"peer":{"name":"laptop","host":"laptop","os":"macOS","home_derp":"fra","found":true,"form":"laptop"},"iface":"utun4"},"sample_fields":["t","rx","tx","pi","po","bi","bo","ui","uo","path","online","active","hs","orx","otx"],"ping_fields":["t","rtt_ms","via","srtt_ms","rttvar_ms"],"samples":[[1767268800.0,0,0,0,0,0,0,0,0,"derp:fra",1,1,1767268760.0,0,0],[1767268801.0,692,1697,3,2,788,1761,3,0,"derp:fra",1,1,1767268760.0,0,0],[1767268802.0,1368,2373,6,3,1560,2469,4,1,"derp:fra",1,1,1767268760.0,0,0],[1767268803.0,2325,3226,8,4,2581,3354,4,2,"derp:fra",1,1,1767268760.0,0,0],[1767268804.0,3637,5025,12,6,4021,5217,8,2,"derp:fra",1,1,1767268760.0,0,0],[1767268805.0,5306,5866,14,7,5754,6090,10,3,"derp:fra",1,1,1767268760.0,0,0],[1767268806.0,6975,7657,18,9,7551,7945,12,3,"derp:fra",1,1,1767268760.0,0,0],[1767268807.0,8491,8678,21,10,9163,8998,14,3,"derp:fra",1,1,1767268760.0,0,0],[1767268808.0,9919,10477,25,12,10719,10861,16,5,"derp:fra",1,1,1767268760.0,0,0],[1767268809.0,11494,11691,29,13,12422,12107,19,5,"derp:fra",1,1,1767268760.0,0,0],[1767268810.0,12143,13538,30,15,13103,14018,20,6,"derp:fra",1,1,1767268760.0,0,0],[1767268811.0,12801,15506,31,17,13793,16050,20,7,"derp:fra",1,1,1767268760.0,0,0],[1767268812.0,14018,17529,33,19,15074,18137,22,8,"derp:fra",1,1,1767268760.0,0,0],[1767268813.0,14651,19099,34,20,15739,19739,22,8,"derp:fra",1,1,1767268760.0,0,0],[1767268814.0,16063,21094,37,22,17247,21798,24,8,"derp:fra",1,1,1767268760.0,0,0],[1767268815.0,17814,22038,45,23,19254,22774,32,8,"derp:fra",1,1,1767268760.0,0,0],[1767268816.0,18821,24150,46,25,20293,24950,33,9,"derp:fra",1,1,1767268760.0,0,0],[1767268817.0,19601,25319,47,26,21105,26151,33,9,"derp:fra",1,1,1767268760.0,0,0],[1767268818.0,20835,26769,50,27,22435,27633,36,10,"derp:fra",1,1,1767268760.0,0,0],[1767268819.0,21812,28717,51,29,23444,29645,36,12,"derp:fra",1,1,1767268760.0,0,0],[1767268820.0,22320,29894,52,30,23984,30854,36,12,"derp:fra",1,1,1767268760.0,0,0],[1767268821.0,23875,32253,54,32,25603,33277,38,12,"derp:fra",1,1,1767268760.0,0,0],[1767268822.0,25520,33788,58,33,27376,34844,41,13,"derp:fra",1,1,1767268760.0,0,0],[1767268823.0,26447,34525,62,34,28431,35613,45,13,"derp:fra",1,1,1767268760.0,0,0],[1767268824.0,26947,35334,63,35,28963,36454,45,13,"derp:fra",1,1,1767268760.0,0,0],[1767268825.0,28217,37191,67,37,30361,38375,47,14,"derp:fra",1,1,1767268760.0,0,0],[1767268826.0,29688,38536,69,38,31896,39752,48,14,"derp:fra",1,1,1767268760.0,0,0],[1767268827.0,30889,39345,71,39,33161,40593,50,14,"derp:fra",1,1,1767268760.0,0,0],[1767268828.0,31436,41002,72,41,33740,42314,51,15,"derp:fra",1,1,1767268760.0,0,0],[1767268829.0,33017,43154,74,43,35385,44530,51,17,"derp:fra",1,1,1767268760.0,0,0],[1767268830.0,34051,45485,75,45,36451,46925,52,18,"derp:fra",1,1,1767268760.0,0,0],[1767268831.0,35007,46760,76,46,37439,48232,53,19,"derp:fra",1,1,1767268760.0,0,0],[1767268832.0,36327,49035,80,48,38887,50571,56,19,"derp:fra",1,1,1767268760.0,0,0],[1767268833.0,37399,49692,83,49,40055,51260,58,19,"derp:fra",1,1,1767268760.0,0,0],[1767268834.0,38614,51207,86,50,41366,52807,61,20,"derp:fra",1,1,1767268760.0,0,0],[1767268835.0,40102,52225,88,51,42918,53857,62,21,"derp:fra",1,1,1767268760.0,0,0],[1767268836.0,41306,54162,93,53,44282,55858,67,21,"derp:fra",1,1,1767268760.0,0,0],[1767268837.0,42214,56298,96,55,45286,58058,69,21,"derp:fra",1,1,1767268760.0,0,0],[1767268838.0,43524,57075,98,56,46660,58867,69,22,"derp:fra",1,1,1767268760.0,0,0],[1767268839.0,44333,57731,100,57,47533,59555,71,22,"derp:fra",1,1,1767268760.0,0,0],[1767268840.0,46053,59583,103,58,49349,61439,74,22,"derp:fra",1,1,1767268760.0,0,0],[1767268841.0,46763,60212,104,59,50091,62100,75,22,"derp:fra",1,1,1767268760.0,0,0],[1767268842.0,47695,62503,107,61,51119,64455,78,22,"derp:fra",1,1,1767268760.0,0,0],[1767268843.0,49053,64217,113,62,52669,66201,83,22,"derp:fra",1,1,1767268760.0,0,0],[1767268844.0,50747,65755,116,63,54459,67771,86,22,"derp:fra",1,1,1767268760.0,0,0],[1767268845.0,52148,66393,118,64,55924,68441,88,23,"derp:fra",1,1,1767268760.0,0,0],[1767268846.0,53617,67282,124,65,57585,69362,93,24,"derp:fra",1,1,1767268760.0,0,0],[1767268847.0,54334,68870,127,66,58398,70982,95,25,"derp:fra",1,1,1767268760.0,0,0],[1767268848.0,55034,69556,128,67,59130,71700,95,26,"derp:fra",1,1,1767268760.0,0,0],[1767268849.0,56582,71397,132,69,60806,73605,97,26,"derp:fra",1,1,1767268760.0,0,0],[1767268850.0,58061,73650,136,71,62413,75922,100,26,"derp:fra",1,1,1767268760.0,0,0],[1767268851.0,59477,74664,141,72,63989,76968,104,26,"derp:fra",1,1,1767268760.0,0,0],[1767268852.0,60469,75412,144,73,65077,77748,107,26,"derp:fra",1,1,1767268760.0,0,0],[1767268853.0,61718,77478,146,75,66390,79878,109,27,"derp:fra",1,1,1767268760.0,0,0],[1767268854.0,62410,79607,147,77,67114,82071,110,27,"derp:fra",1,1,1767268760.0,0,0],[1767268855.0,63737,81262,151,78,68569,83758,114,27,"derp:fra",1,1,1767268760.0,0,0],[1767268856.0,64986,83340,153,80,69882,85900,114,28,"derp:fra",1,1,1767268760.0,0,0],[1767268857.0,66091,85217,158,82,71147,87841,119,30,"derp:fra",1,1,1767268760.0,0,0],[1767268858.0,67134,85989,159,83,72222,88645,119,31,"derp:fra",1,1,1767268760.0,0,0],[1767268859.0,68163,88328,161,85,73315,91048,119,31,"derp:fra",1,1,1767268760.0,0,0],[1767268860.0,69332,89940,166,87,74644,92724,124,31,"derp:fra",1,1,1767268760.0,0,0],[1767268861.0,71131,90574,171,88,76603,93390,129,31,"derp:fra",1,1,1767268760.0,0,0],[1767268862.0,72172,91310,173,89,77708,94158,129,31,"derp:fra",1,1,1767268760.0,0,0],[1767268863.0,72936,93183,174,91,78504,96095,130,33,"derp:fra",1,1,1767268760.0,0,0],[1767268864.0,73539,94319,175,92,79139,97263,130,33,"derp:fra",1,1,1767268760.0,0,0],[1767268865.0,75063,95831,179,93,80791,98807,133,34,"derp:fra",1,1,1767268760.0,0,0],[1767268866.0,75594,96506,180,94,81354,99514,133,35,"derp:fra",1,1,1767268760.0,0,0],[1767268867.0,76979,97323,182,95,82803,100363,133,35,"derp:fra",1,1,1767268760.0,0,0],[1767268868.0,77919,98553,184,96,83807,101625,133,35,"derp:fra",1,1,1767268760.0,0,0],[1767268869.0,78530,99864,187,97,84514,102968,134,35,"direct:wan",1,1,1767268760.0,0,0],[1767268870.0,79912,100987,193,98,86088,104123,138,35,"direct:wan",1,1,1767268760.0,0,0],[1767268871.0,81012,102083,197,99,87316,105251,141,35,"direct:wan",1,1,1767268760.0,0,0],[1767268872.0,82051,102690,199,100,88419,105890,142,35,"direct:wan",1,1,1767268760.0,0,0],[1767268873.0,82997,103923,204,101,89525,107155,147,35,"direct:wan",1,1,1767268760.0,0,0],[1767268874.0,84068,105495,207,102,90692,108759,150,35,"direct:wan",1,1,1767268760.0,0,0],[1767268875.0,102645,935125,236,849,110197,962293,177,782,"direct:wan",1,1,1767268760.0,0,0],[1767268876.0,119339,1596757,272,1389,128043,1641205,211,1321,"direct:wan",1,1,1767268760.0,0,0],[1767268877.0,140594,2331850,298,1993,150130,2395626,236,1923,"direct:wan",1,1,1767268760.0,0,0],[1767268878.0,166334,3142094,331,2697,176926,3228398,267,2627,"direct:wan",1,1,1767268760.0,0,0],[1767268879.0,189340,3786236,357,3244,200764,3890044,292,3173,"direct:wan",1,1,1767268760.0,0,0],[1767268880.0,207303,4438519,391,3794,219815,4559927,325,3723,"direct:wan",1,1,1767268760.0,0,0],[1767268881.0,233397,5035696,441,4292,247509,5173040,374,4221,"direct:wan",1,1,1767268760.0,0,0],[1767268882.0,261150,5791440,476,4954,276382,5949968,408,4883,"direct:wan",1,1,1767268760.0,0,0],[1767268883.0,281363,6491931,524,5553,298131,6669627,454,5480,"direct:wan",1,1,1767268760.0,0,0],[1767268884.0,301886,7197056,563,6168,319902,7394432,493,6093,"direct:wan",1,1,1767268760.0,0,0],[1767268885.0,322893,7810803,586,6678,341645,8024499,516,6601,"direct:wan",1,1,1767268760.0,0,0],[1767268886.0,344599,8566378,614,7340,364247,8801258,543,7262,"direct:wan",1,1,1767268760.0,0,0],[1767268887.0,364670,9437269,637,8094,385054,9696277,564,8016,"direct:wan",1,1,1767268760.0,0,0],[1767268888.0,386211,9989663,699,8558,408579,10263519,625,8479,"direct:wan",1,1,1767268760.0,0,0],[1767268889.0,402869,10730849,736,9212,426421,11025633,661,9133,"direct:wan",1,1,1767268760.0,0,0],[1767268890.0,417222,11471642,753,9902,441318,11788506,678,9821,"direct:wan",1,1,1767268760.0,0,0],[1767268891.0,427755,12168469,777,10499,452619,12504437,701,10417,"direct:wan",1,1,1767268760.0,0,0],[1767268892.0,451033,12902863,814,11120,477081,13258703,738,11038,"direct:wan",1,1,1767268760.0,0,0],[1767268893.0,474051,13625425,929,11756,503779,14001617,852,11672,"direct:wan",1,1,1767268760.0,0,0],[1767268894.0,494109,14228718,957,12325,524733,14623118,878,12240,"direct:wan",1,1,1767268760.0,0,0],[1767268895.0,524825,14839298,1016,12893,557337,15251874,936,12807,"direct:wan",1,1,1767268760.0,0,0],[1767268896.0,535908,15562344,1033,13549,568964,15995912,952,13462,"direct:wan",1,1,1767268760.0,0,0],[1767268897.0,562105,16270578,1078,14133,596601,16722834,996,14045,"direct:wan",1,1,1767268760.0,0,0],[1767268898.0,586324,16908778,1157,14714,623348,17379626,1075,14624,"direct:wan",1,1,1767268760.0,0,0],[1767268899.0,608562,17726995,1206,15382,647154,18219219,1122,15290,"direct:wan",1,1,1767268760.0,0,0],[1767268900.0,637188,18447930,1254,16009,677316,18960218,1170,15916,"direct:wan",1,1,1767268760.0,0,0],[1767268901.0,666310,19086064,1299,16575,707878,19616464,1214,16481,"direct:wan",1,1,1767268760.0,0,0],[1767268902.0,691328,19892083,1332,17245,733952,20443923,1246,17149,"direct:wan",1,1,1767268760.0,0,0],[1767268903.0,719916,20632183,1443,17918,766092,21205559,1357,17822,"direct:wan",1,1,1767268760.0,0,0],[1767268904.0,958702,21506518,1857,18684,1018126,22104406,1771,18588,"direct:wan",1,1,1767268760.0,0,0],[1767268905.0,1228858,22268613,2605,19393,1312218,22889189,2518,19295,"direct:wan",1,1,1767268760.0,0,0],[1767268906.0,1537306,23070308,3017,20120,1633850,23714148,2930,20022,"direct:wan",1,1,1767268760.0,0,0],[1767268907.0,1788251,23883024,3466,20860,1899163,24550544,3379,20760,"direct:wan",1,1,1767268760.0,0,0],[1767268908.0,2113502,24601342,4140,21466,2245982,25288254,4053,21365,"direct:wan",1,1,1767268760.0,0,0],[1767268909.0,2429706,25398885,4611,22169,2577258,26108293,4524,22068,"direct:wan",1,1,1767268760.0,0,0],[1767268910.0,2446974,26131601,4631,22841,2595166,26862513,4544,22739,"direct:wan",1,1,1767268760.0,0,0],[1767268911.0,2473304,26934818,4663,23526,2622520,27687650,4575,23423,"direct:wan",1,1,1767268760.0,0,0],[1767268912.0,2494591,27722852,4727,24224,2645855,28498020,4639,24119,"direct:wan",1,1,1767268760.0,0,0],[1767268913.0,2510592,28534628,4788,24953,2663808,29333124,4700,24848,"direct:wan",1,1,1767268760.0,0,0],[1767268914.0,2541208,29357784,4939,25639,2699256,30178232,4849,25532,"direct:wan",1,1,1767268760.0,0,0],[1767268915.0,2563355,30157951,4990,26363,2723035,31001567,4898,26256,"direct:wan",1,1,1767268760.0,0,0],[1767268916.0,2590036,30785595,5025,26928,2750836,31647291,4933,26821,"direct:wan",1,1,1767268760.0,0,0],[1767268917.0,2613369,31468526,5141,27484,2777881,32348014,5049,27376,"direct:wan",1,1,1767268760.0,0,0],[1767268918.0,2634222,32211236,5234,28187,2801710,33113220,5141,28079,"direct:wan",1,1,1767268760.0,0,0],[1767268919.0,2653867,32981743,5327,28808,2824331,33903599,5232,28698,"direct:wan",1,1,1767268760.0,0,0],[1767268920.0,2674326,33788952,5361,29484,2845878,34732440,5266,29372,"direct:wan",1,1,1767268920.0,0,0],[1767268921.0,2700115,34538925,5414,30166,2873363,35504237,5319,30053,"direct:wan",1,1,1767268920.0,0,0],[1767268922.0,2722620,35486763,5447,31019,2896924,36479371,5350,30906,"direct:wan",1,1,1767268920.0,0,0],[1767268923.0,2745755,36404958,5497,31816,2921659,37423070,5400,31703,"direct:wan",1,1,1767268920.0,0,0],[1767268924.0,2764052,37084071,5559,32402,2941940,38120935,5462,32288,"direct:wan",1,1,1767268920.0,0,0],[1767268925.0,2789914,37818674,5611,33018,2969466,38875250,5514,32904,"direct:wan",1,1,1767268920.0,0,0],[1767268926.0,2807805,38460608,5634,33553,2988093,39534304,5537,33437,"direct:wan",1,1,1767268920.0,0,0],[1767268927.0,2829465,39126828,5678,34158,3011161,40219884,5581,34042,"direct:wan",1,1,1767268920.0,0,0],[1767268928.0,2860025,39828384,5813,34803,3046041,40942080,5716,34686,"direct:wan",1,1,1767268920.0,0,0],[1767268929.0,2875021,40565380,5842,35491,3061965,41701092,5744,35374,"direct:wan",1,1,1767268920.0,0,0],[1767268930.0,2875603,40566745,5844,35492,3062611,41702489,5746,35375,"direct:wan",1,1,1767268920.0,0,0],[1767268931.0,2876256,40567742,5845,35493,3063296,41703518,5746,35375,"direct:wan",1,1,1767268920.0,0,0],[1767268932.0,2876768,40568874,5846,35494,3063840,41704682,5746,35375,"direct:wan",1,1,1767268920.0,0,0],[1767268933.0,2877358,40569763,5848,35495,3064494,41705603,5746,35375,"direct:wan",1,1,1767268920.0,0,0],[1767268934.0,2878274,40571697,5849,35497,3065442,41707601,5746,35376,"direct:wan",1,1,1767268920.0,0,0],[1767268935.0,2879190,40572456,5851,35498,3066422,41708392,5748,35376,"direct:wan",1,1,1767268920.0,0,0],[1767268936.0,2879897,40573891,5852,35499,3067161,41709859,5748,35377,"direct:wan",1,1,1767268920.0,0,0],[1767268937.0,2880952,40575305,5855,35500,3068312,41711305,5750,35377,"direct:wan",1,1,1767268920.0,0,0],[1767268938.0,2882091,40576010,5856,35501,3069483,41712042,5750,35377,"direct:wan",1,1,1767268920.0,0,0],[1767268939.0,2883336,40578252,5859,35503,3070824,41714348,5753,35378,"direct:wan",1,1,1767268920.0,0,0],[1767268940.0,2884725,40578864,5862,35504,3072309,41714992,5755,35379,"direct:wan",1,1,1767268920.0,0,0],[1767268941.0,2885557,40581047,5866,35506,3073269,41717239,5757,35381,"direct:wan",1,1,1767268920.0,0,0],[1767268942.0,2886869,40583298,5868,35508,3074645,41719554,5757,35382,"direct:wan",1,1,1767268920.0,0,0],[1767268943.0,2887700,40584478,5869,35509,3075508,41720766,5757,35383,"direct:wan",1,1,1767268920.0,0,0],[1767268944.0,2888604,40586082,5870,35510,3076444,41722402,5757,35384,"direct:wan",1,1,1767268920.0,0,0],[1767268945.0,2889898,40587985,5872,35512,3077802,41724369,5759,35384,"direct:wan",1,1,1767268920.0,0,0],[1767268946.0,2890852,40589896,5874,35514,3078820,41726344,5760,35386,"direct:wan",1,1,1767268920.0,0,0],[1767268947.0,2892412,40591314,5878,35515,3080508,41727794,5764,35387,"direct:wan",1,1,1767268920.0,0,0],[1767268948.0,2893306,40593398,5880,35517,3081466,41729942,5766,35387,"direct:wan",1,1,1767268920.0,0,0],[1767268949.0,2895033,40594796,5882,35518,3083257,41731372,5766,35387,"direct:wan",1,1,1767268920.0,0,0],[1767268950.0,2896164,40596256,5884,35519,3084452,41732864,5767,35387,"direct:wan",1,1,1767268920.0,0,0],[1767268951.0,2896671,40596903,5885,35520,3084991,41733543,5767,35388,"direct:wan",1,1,1767268920.0,0,0],[1767268952.0,2898437,40599066,5888,35522,3086853,41735770,5769,35390,"direct:wan",1,1,1767268920.0,0,0],[1767268953.0,2899818,40600400,5890,35523,3088298,41737136,5769,35390,"direct:wan",1,1,1767268920.0,0,0],[1767268954.0,2900401,40602345,5892,35525,3088945,41739145,5770,35390,"direct:wan",1,1,1767268920.0,0,0],[1767268955.0,2901933,40603056,5894,35526,3090541,41739888,5772,35391,"direct:wan",1,1,1767268920.0,0,0],[1767268956.0,2902568,40605411,5895,35528,3091208,41742307,5773,35393,"direct:wan",1,1,1767268920.0,0,0],[1767268957.0,2903406,40606600,5896,35529,3092078,41743528,5774,35394,"direct:wan",1,1,1767268920.0,0,0],[1767268958.0,2904624,40608906,5899,35531,3093392,41745898,5775,35395,"direct:wan",1,1,1767268920.0,0,0],[1767268959.0,2905644,40609800,5900,35532,3094444,41746824,5775,35396,"direct:wan",1,1,1767268920.0,0,0],[1767268960.0,2907405,40610938,5904,35533,3096333,41747994,5779,35397,"direct:wan",1,1,1767268920.0,0,0],[1767268961.0,2908576,40612107,5908,35534,3097632,41749195,5783,35397,"direct:wan",1,1,1767268920.0,0,0],[1767268962.0,2910162,40614280,5910,35536,3099282,41751432,5783,35398,"direct:wan",1,1,1767268920.0,0,0],[1767268963.0,2911178,40615094,5912,35537,3100362,41752278,5783,35398,"direct:wan",1,1,1767268920.0,0,0],[1767268964.0,2912438,40617327,5913,35539,3101654,41754575,5784,35398,"direct:wan",1,1,1767268920.0,0,0],[1767268965.0,2913409,40618832,5914,35540,3102657,41756112,5784,35399,"direct:wan",1,1,1767268920.0,0,0],[1767268966.0,2914965,40621111,5916,35542,3104277,41758455,5784,35399,"direct:wan",1,1,1767268920.0,0,0],[1767268967.0,2915534,40623241,5917,35544,3104878,41760649,5784,35399,"direct:wan",1,1,1767268920.0,0,0],[1767268968.0,2917083,40624696,5924,35545,3106651,41762136,5791,35399,"direct:wan",1,1,1767268920.0,0,0],[1767268969.0,2917588,40625407,5925,35546,3107188,41762879,5791,35399,"direct:wan",1,1,1767268920.0,0,0],[1767268970.0,2918547,40627100,5927,35547,3108211,41764604,5793,35400,"direct:wan",1,1,1767268920.0,0,0],[1767268971.0,2919322,40628024,5928,35548,3109018,41765560,5794,35400,"direct:wan",1,1,1767268920.0,0,0],[1767268972.0,2920018,40629547,5930,35549,3109778,41767115,5795,35400,"direct:wan",1,1,1767268920.0,0,0],[1767268973.0,2920632,40630170,5931,35550,3110424,41767770,5795,35400,"direct:wan",1,1,1767268920.0,0,0],[1767268974.0,2922316,40632092,5933,35552,3112172,41769756,5796,35400,"direct:wan",1,1,1767268920.0,0,0],[1767268975.0,2922942,40632782,5934,35553,3112830,41770478,5797,35401,"direct:wan",1,1,1767268920.0,0,0],[1767268976.0,2923656,40633501,5935,35554,3113576,41771229,5798,35402,"direct:wan",1,1,1767268920.0,0,0],[1767268977.0,2925194,40635417,5938,35556,3115210,41773209,5801,35402,"direct:wan",1,1,1767268920.0,0,0],[1767268978.0,2926327,40637058,5940,35558,3116407,41774914,5802,35402,"direct:wan",1,1,1767268920.0,0,0],[1767268979.0,2927721,40639387,5943,35560,3117897,41777307,5803,35402,"direct:wan",1,1,1767268920.0,0,0],[1767268980.0,2928580,40640913,5946,35561,3118852,41778865,5804,35403,"direct:wan",1,1,1767268920.0,0,0]],"pings":[[1767268800.05,167.69,"derp:fra",167.69,83.84],[1767268801.05,166.79,"derp:fra",167.58,63.11],[1767268802.05,153.01,"derp:fra",165.76,50.97],[1767268803.05,178.72,"derp:fra",167.38,41.47],[1767268804.05,168.6,"derp:fra",167.53,31.41],[1767268805.05,175.52,"derp:fra",168.53,25.55],[1767268806.05,173.3,"derp:fra",169.13,20.36],[1767268807.05,171.37,"derp:fra",169.41,15.83],[1767268808.05,170.79,"derp:fra",169.58,12.22],[1767268809.05,165.86,"derp:fra",169.11,10.09],[1767268810.05,179.75,"derp:fra",170.44,10.23],[1767268811.05,165.65,"derp:fra",169.84,8.87],[1767268812.05,183.15,"derp:fra",171.51,9.98],[1767268813.05,149.28,"derp:fra",168.73,13.04],[1767268814.05,181.24,"derp:fra",170.29,12.91],[1767268815.05,171.6,"derp:fra",170.46,10.01],[1767268816.05,175.19,"derp:fra",171.05,8.69],[1767268817.05,178.94,"derp:fra",172.03,8.49],[1767268818.05,175.07,"derp:fra",172.41,7.13],[1767268819.05,172.91,"derp:fra",172.48,5.47],[1767268820.05,167.79,"derp:fra",171.89,5.27],[1767268821.05,174.8,"derp:fra",172.25,4.68],[1767268822.05,167.57,"derp:fra",171.67,4.68],[1767268823.05,null,null,171.67,4.68],[1767268824.05,190.51,"derp:fra",174.02,8.22],[1767268825.05,173.31,"derp:fra",173.93,6.35],[1767268826.05,165.7,"derp:fra",172.91,6.82],[1767268827.05,170.44,"derp:fra",172.6,5.73],[1767268828.05,161.69,"derp:fra",171.23,7.02],[1767268829.05,148.98,"derp:fra",168.45,10.83],[1767268830.05,152.65,"derp:fra",166.48,12.07],[1767268831.05,166.4,"derp:fra",166.47,9.07],[1767268832.05,168.48,"derp:fra",166.72,7.31],[1767268833.05,171.95,"derp:fra",167.37,6.79],[1767268834.05,170.98,"derp:fra",167.82,5.99],[1767268835.05,176.68,"derp:fra",168.93,6.71],[1767268836.05,185.03,"derp:fra",170.94,9.06],[1767268837.05,160.44,"derp:fra",169.63,9.42],[1767268838.05,187.44,"derp:fra",171.86,11.52],[1767268839.05,197.05,"derp:fra",175.01,14.94],[1767268840.05,164.85,"derp:fra",173.74,13.74],[1767268841.05,168.37,"derp:fra",173.07,11.65],[1767268842.05,170.78,"derp:fra",172.78,9.31],[1767268843.05,160.97,"derp:fra",171.3,9.93],[1767268844.05,157.83,"derp:fra",169.62,10.82],[1767268845.05,167.53,"derp:fra",169.36,8.64],[1767268846.05,164.82,"derp:fra",168.79,7.61],[1767268847.05,158.57,"derp:fra",167.51,8.26],[1767268848.05,157.44,"derp:fra",166.25,8.72],[1767268849.05,194.42,"derp:fra",169.77,13.58],[1767268850.05,189.07,"derp:fra",172.19,15.01],[1767268851.05,159.95,"derp:fra",170.66,14.31],[1767268852.05,174.71,"derp:fra",171.16,11.75],[1767268853.05,166.44,"derp:fra",170.57,9.99],[1767268854.05,175.72,"derp:fra",171.22,8.78],[1767268855.05,179.21,"derp:fra",172.22,8.58],[1767268856.05,179.1,"derp:fra",173.08,8.16],[1767268857.05,171.04,"derp:fra",172.82,6.63],[1767268858.05,170.69,"derp:fra",172.56,5.5],[1767268859.05,151.13,"derp:fra",169.88,9.48],[1767268860.05,166.47,"derp:fra",169.45,7.97],[1767268861.05,171.79,"derp:fra",169.74,6.56],[1767268862.05,150.29,"derp:fra",167.31,9.78],[1767268863.05,181.2,"derp:fra",169.05,10.81],[1767268864.05,163.21,"derp:fra",168.32,9.57],[1767268865.05,168.66,"derp:fra",168.36,7.26],[1767268866.05,146.47,"derp:fra",165.62,10.92],[1767268867.05,173.76,"derp:fra",166.64,10.22],[1767268868.05,163.18,"derp:fra",166.21,8.53],[1767268869.05,64.87,"direct:wan",153.54,31.73],[1767268870.05,66.41,"direct:wan",142.65,45.58],[1767268871.05,65.08,"direct:wan",132.95,53.58],[1767268872.05,68.37,"direct:wan",124.88,56.33],[1767268873.05,78.59,"direct:wan",119.09,53.82],[1767268874.05,74.33,"direct:wan",113.5,51.56],[1767268875.05,100.88,"direct:wan",111.92,41.82],[1767268876.05,105.31,"direct:wan",111.1,33.02],[1767268877.05,102.04,"direct:wan",109.96,27.03],[1767268878.05,95.55,"direct:wan",108.16,23.87],[1767268879.05,103.61,"direct:wan",107.59,19.04],[1767268880.05,105.0,"direct:wan",107.27,14.93],[1767268881.05,105.72,"direct:wan",107.07,11.59],[1767268882.05,105.84,"direct:wan",106.92,9.0],[1767268883.05,100.99,"direct:wan",106.18,8.23],[1767268884.05,100.82,"direct:wan",105.51,7.51],[1767268885.05,107.46,"direct:wan",105.75,6.12],[1767268886.05,96.11,"direct:wan",104.55,7.0],[1767268887.05,101.9,"direct:wan",104.22,5.91],[1767268888.05,103.34,"direct:wan",104.11,4.65],[1767268889.05,106.68,"direct:wan",104.43,4.13],[1767268890.05,105.75,"direct:wan",104.59,3.43],[1767268891.05,112.32,"direct:wan",105.56,4.5],[1767268892.05,107.3,"direct:wan",105.78,3.81],[1767268893.05,95.92,"direct:wan",104.55,5.32],[1767268894.05,103.1,"direct:wan",104.36,4.35],[1767268895.05,105.83,"direct:wan",104.55,3.63],[1767268896.05,99.18,"direct:wan",103.88,4.07],[1767268897.05,105.19,"direct:wan",104.04,3.38],[1767268898.05,101.35,"direct:wan",103.7,3.21],[1767268899.05,103.78,"direct:wan",103.71,2.42],[1767268900.05,101.06,"direct:wan",103.38,2.48],[1767268901.05,107.78,"direct:wan",103.93,2.96],[1767268902.05,107.07,"direct:wan",104.32,3.0],[1767268903.05,94.39,"direct:wan",103.08,4.74],[1767268904.05,97.45,"direct:wan",102.38,4.96],[1767268905.05,100.25,"direct:wan",102.11,4.25],[1767268906.05,102.08,"direct:wan",102.11,3.2],[1767268907.05,110.13,"direct:wan",103.11,4.4],[1767268908.05,103.65,"direct:wan",103.18,3.44],[1767268909.05,103.79,"direct:wan",103.25,2.73],[1767268910.05,103.35,"direct:wan",103.27,2.07],[1767268911.05,106.61,"direct:wan",103.68,2.39],[1767268912.05,97.47,"direct:wan",102.91,3.35],[1767268913.05,105.0,"direct:wan",103.17,3.03],[1767268914.05,100.15,"direct:wan",102.79,3.03],[1767268915.05,103.27,"direct:wan",102.85,2.39],[1767268916.05,102.25,"direct:wan",102.78,1.94],[1767268917.05,106.64,"direct:wan",103.26,2.42],[1767268918.05,103.5,"direct:wan",103.29,1.88],[1767268919.05,105.8,"direct:wan",103.6,2.04],[1767268920.05,105.94,"direct:wan",103.9,2.11],[1767268921.05,101.85,"direct:wan",103.64,2.09],[1767268922.05,103.71,"direct:wan",103.65,1.59],[1767268923.05,97.63,"direct:wan",102.9,2.7],[1767268924.05,106.19,"direct:wan",103.31,2.85],[1767268925.05,105.73,"direct:wan",103.61,2.74],[1767268926.05,103.63,"direct:wan",103.61,2.06],[1767268927.05,106.1,"direct:wan",103.92,2.17],[1767268928.05,100.04,"direct:wan",103.44,2.6],[1767268929.05,92.72,"direct:wan",102.1,4.63],[1767268930.05,61.82,"direct:wan",97.06,13.54],[1767268931.05,63.48,"direct:wan",92.87,18.55],[1767268932.05,68.79,"direct:wan",89.86,19.93],[1767268933.05,71.83,"direct:wan",87.6,19.46],[1767268934.05,64.06,"direct:wan",84.66,20.48],[1767268935.05,72.1,"direct:wan",83.09,18.5],[1767268936.05,62.2,"direct:wan",80.48,19.1],[1767268937.05,66.74,"direct:wan",78.76,17.76],[1767268938.05,74.92,"direct:wan",78.28,14.28],[1767268939.05,68.79,"direct:wan",77.09,13.08],[1767268940.05,64.57,"direct:wan",75.53,12.94],[1767268941.05,null,null,75.53,12.94],[1767268942.05,65.71,"direct:wan",74.3,12.16],[1767268943.05,67.94,"direct:wan",73.51,10.71],[1767268944.05,65.8,"direct:wan",72.54,9.96],[1767268945.05,73.13,"direct:wan",72.62,7.62],[1767268946.05,69.17,"direct:wan",72.19,6.57],[1767268947.05,70.61,"direct:wan",71.99,5.32],[1767268948.05,66.22,"direct:wan",71.27,5.44],[1767268949.05,64.86,"direct:wan",70.47,5.68],[1767268950.05,63.86,"direct:wan",69.64,5.91],[1767268951.05,69.44,"direct:wan",69.62,4.48],[1767268952.05,66.77,"direct:wan",69.26,4.07],[1767268953.05,68.89,"direct:wan",69.21,3.15],[1767268954.05,68.84,"direct:wan",69.17,2.45],[1767268955.05,63.19,"direct:wan",68.42,3.34],[1767268956.05,73.75,"direct:wan",69.09,3.83],[1767268957.05,74.25,"direct:wan",69.73,4.17],[1767268958.05,66.83,"direct:wan",69.37,3.85],[1767268959.05,75.41,"direct:wan",70.12,4.4],[1767268960.05,69.0,"direct:wan",69.98,3.58],[1767268961.05,70.2,"direct:wan",70.01,2.74],[1767268962.05,61.82,"direct:wan",68.99,4.1],[1767268963.05,67.16,"direct:wan",68.76,3.53],[1767268964.05,63.57,"direct:wan",68.11,3.95],[1767268965.05,73.34,"direct:wan",68.76,4.27],[1767268966.05,73.26,"direct:wan",69.33,4.32],[1767268967.05,63.96,"direct:wan",68.65,4.59],[1767268968.05,67.05,"direct:wan",68.45,3.84],[1767268969.05,67.19,"direct:wan",68.3,3.2],[1767268970.05,62.89,"direct:wan",67.62,3.75],[1767268971.05,73.71,"direct:wan",68.38,4.33],[1767268972.05,65.39,"direct:wan",68.01,4.0],[1767268973.05,69.85,"direct:wan",68.24,3.46],[1767268974.05,68.08,"direct:wan",68.22,2.63],[1767268975.05,76.82,"direct:wan",69.29,4.13],[1767268976.05,63.78,"direct:wan",68.6,4.47],[1767268977.05,70.56,"direct:wan",68.85,3.84],[1767268978.05,67.9,"direct:wan",68.73,3.12],[1767268979.05,67.55,"direct:wan",68.58,2.63],[1767268980.05,71.58,"direct:wan",68.96,2.73]],"errors":{},"recorded":{"started_at":1767268800.0,"seconds":180,"host_tz":"+0000"}}</script>
+<script>
+(function () {
+  "use strict";
+  var TZ = -new Date().getTimezoneOffset() * 60;   // browser local time offset, seconds
+  var reduceMotion = false;
+  try { reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { /* old browser */ }
+  var $ = function (id) { return document.getElementById(id); };
+  var REGION = { sin: "Singapore", tok: "Tokyo", hkg: "Hong Kong", sea: "Seattle", lax: "Los Angeles", bom: "Mumbai", syd: "Sydney", fra: "Frankfurt", lhr: "London", nyc: "New York", sfo: "San Francisco", ord: "Chicago", dfw: "Dallas", ams: "Amsterdam", par: "Paris", sao: "São Paulo", jnb: "Johannesburg", nai: "Nairobi", mad: "Madrid", hnl: "Honolulu", dbi: "Dubai", waw: "Warsaw", tor: "Toronto", den: "Denver", mia: "Miami", blr: "Bengaluru" };
+
+  // ------------------------------------------------------------------ data
+  var store = { samples: [], pings: [], rates: [], meta: {}, every: 1, recorded: null, errors: {}, source: "trace", srcLabel: "" };
+
+  function idx(fields) { var m = {}; (fields || []).forEach(function (k, i) { m[k] = i; }); return m; }
+  function normSamples(doc) {
+    var ix = idx(doc.sample_fields);
+    function g(r, k, alt) { if (k in ix) return r[ix[k]]; if (alt && (alt in ix)) return r[ix[alt]]; return null; }
+    return (doc.samples || []).map(function (r) {
+      return { t: r[ix.t], rx: g(r, "rx"), tx: g(r, "tx"), pi: g(r, "pi"), po: g(r, "po"), bi: g(r, "bi"), bo: g(r, "bo"),
+        ui: g(r, "ui", "ipk"), uo: g(r, "uo", "opk"), path: g(r, "path") || "none", online: g(r, "online"), active: g(r, "active"),
+        hs: g(r, "hs"), orx: g(r, "orx"), otx: g(r, "otx") };
+    }).filter(function (s) { return typeof s.t === "number"; });
+  }
+  function normPings(doc) {
+    var ix = idx(doc.ping_fields || ["t", "rtt_ms", "via", "srtt_ms", "rttvar_ms"]);
+    return (doc.pings || []).map(function (r) {
+      return { t: r[ix.t], rtt: r[ix.rtt_ms], via: r[ix.via], srtt: r[ix.srtt_ms], rttvar: r[ix.rttvar_ms] };
+    }).filter(function (p) { return typeof p.t === "number"; });
+  }
+  function mergeByT(a, b) {
+    var seen = {}, out = [];
+    a.concat(b).sort(function (x, y) { return x.t - y.t; }).forEach(function (s) {
+      var k = s.t.toFixed(2);
+      if (!seen[k]) { seen[k] = 1; out.push(s); }
+    });
+    return out;
+  }
+  function trim(arr, keepS) {
+    if (!arr.length) return arr;
+    var lim = arr[arr.length - 1].t - keepS, i = 0;
+    while (i < arr.length && arr[i].t < lim) i++;
+    return i ? arr.slice(i) : arr;
+  }
+
+  function computeRates() {
+    var S = store.samples, out = [], b = null, gapS = Math.max(3.5, 3.5 * store.every);
+    for (var i = 0; i < S.length; i++) {
+      var s = S[i];
+      if (!b) { b = s; continue; }
+      var dt = s.t - b.t;
+      if (dt < 0.5) continue;
+      var d = (function (s, b) { return function (k) { return (s[k] != null && b[k] != null && s[k] >= b[k]) ? s[k] - b[k] : null; }; })(s, b);
+      var dtx = d("tx"), drx = d("rx"), dotx = d("otx"), dorx = d("orx");
+      var dpo = d("po"), dpi = d("pi"), dbo = d("bo"), dbi = d("bi"), duo = d("uo"), dui = d("ui");
+      var shOut = (dtx != null && dotx != null) ? (dtx + dotx > 0 ? dtx / (dtx + dotx) : 1) : 1;
+      var shIn = (drx != null && dorx != null) ? (drx + dorx > 0 ? drx / (drx + dorx) : 1) : 1;
+      out.push({
+        t: s.t, t0: b.t, dt: dt, gap: dt > gapS,
+        up: dtx == null ? null : dtx / dt, down: drx == null ? null : drx / dt,
+        pout: dpo == null ? null : dpo / dt, pin: dpi == null ? null : dpi / dt,
+        nout: dpo == null ? null : dpo * shOut / dt, nin: dpi == null ? null : dpi * shIn / dt,
+        uout: duo == null ? null : duo / dt, uin: dui == null ? null : dui / dt,
+        szOut: (dpo && dbo != null) ? dbo / dpo : null, szIn: (dpi && dbi != null) ? dbi / dpi : null,
+        othOut: dotx, othIn: dorx,
+        path: s.path, online: s.online, hs: s.hs
+      });
+      b = s;
+    }
+    store.rates = out;
+  }
+
+  function bsearch(arr, t) { // last index with arr[i].t <= t, or -1
+    var lo = 0, hi = arr.length - 1, ans = -1;
+    while (lo <= hi) { var m = (lo + hi) >> 1; if (arr[m].t <= t) { ans = m; lo = m + 1; } else hi = m - 1; }
+    return ans;
+  }
+  function rateAt(t) { // interval containing t
+    var R = store.rates; if (!R.length) return null;
+    var i = bsearch(R, t);
+    if (i < R.length - 1 && (i < 0 || R[i].t < t)) i = i + 1;
+    if (i < 0) i = 0;
+    return R[Math.min(i, R.length - 1)];
+  }
+  function counterAt(t, k) {
+    var S = store.samples; var i = bsearch(S, t);
+    if (i < 0) return S.length ? S[0][k] : null;
+    if (i >= S.length - 1) return S[S.length - 1][k];
+    var a = S[i], b = S[i + 1];
+    if (a[k] == null || b[k] == null) return a[k];
+    return a[k] + (b[k] - a[k]) * (t - a.t) / (b.t - a.t);
+  }
+  function tStart() { return store.samples.length ? store.samples[0].t : 0; }
+  function tEnd() { return store.samples.length ? store.samples[store.samples.length - 1].t : 0; }
+
+  function pctl(sorted, q) { if (!sorted.length) return null; var k = (sorted.length - 1) * q, lo = Math.floor(k), hi = Math.min(lo + 1, sorted.length - 1); return sorted[lo] + (sorted[hi] - sorted[lo]) * (k - lo); }
+  function overall() {
+    var S = store.samples, R = store.rates, P = store.pings;
+    var span = S.length > 1 ? S[S.length - 1].t - S[0].t : 0;
+    function tot(k) { var a = S[0] && S[0][k], b = S.length && S[S.length - 1][k]; return (a != null && b != null) ? b - a : null; }
+    function peak(k) { var m = null; R.forEach(function (r) { if (r[k] != null && (m == null || r[k] > m)) m = r[k]; }); return m; }
+    var ok = P.filter(function (p) { return p.rtt != null; }).map(function (p) { return p.rtt; }).sort(function (a, b) { return a - b; });
+    var paths = {}; S.forEach(function (s) { paths[s.path] = (paths[s.path] || 0) + 1; });
+    var oth = 0, othKnown = false; R.forEach(function (r) { if (r.othOut != null) { othKnown = true; oth += r.othOut + (r.othIn || 0); } });
+    return { span: span, upTot: tot("tx"), downTot: tot("rx"), upPeak: peak("up"), downPeak: peak("down"),
+      upMean: span && tot("tx") != null ? tot("tx") / span : null, downMean: span && tot("rx") != null ? tot("rx") / span : null,
+      rttP50: pctl(ok, 0.5), rttP95: pctl(ok, 0.95), rttMax: ok.length ? ok[ok.length - 1] : null, rttMin: ok.length ? ok[0] : null,
+      pings: P.length, lost: P.length - ok.length, paths: paths, oth: othKnown ? oth : null };
+  }
+
+  // ------------------------------------------------------------------ format
+  function fmtClock(t) { if (t == null) return "--:--:--"; return new Date((t + TZ) * 1000).toISOString().slice(11, 19); }
+  function bits(Bps) { // -> [number text, unit]
+    if (Bps == null || !isFinite(Bps)) return ["—", ""];
+    var b = Bps * 8;
+    if (b >= 1e6) return [(b / 1e6).toFixed(b >= 1e7 ? 1 : 2), "Mbps"];
+    if (b >= 1e3) return [String(Math.round(b / 1e3)), "kbps"];
+    return [String(Math.round(b)), "bps"];
+  }
+  function bitsTxt(Bps) { var x = bits(Bps); return x[1] ? x[0] + " " + x[1] : x[0]; }
+  function bytes(n) {
+    if (n == null || !isFinite(n)) return "—";
+    var u = ["B", "KB", "MB", "GB", "TB"], i = 0; n = Math.max(0, n);
+    while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+    return (i === 0 ? Math.round(n) : n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2)) + " " + u[i];
+  }
+  function intc(n) { return n == null || !isFinite(n) ? "—" : Math.round(n).toLocaleString(); }
+  function ms(n) { return n == null ? "—" : (n >= 100 ? Math.round(n) : n.toFixed(1).replace(/\.0$/, "")); }
+  function pathInfo(code) {
+    code = code || "none";
+    if (code.indexOf("derp:") === 0) { var r = code.slice(5); return { kind: "derp", region: r, label: "DERP " + r, ko: "DERP relay (" + (REGION[r] || r) + ")" }; }
+    if (code.indexOf("direct:") === 0) { var n = code.slice(7); return { kind: "direct", net: n, label: "direct " + n.toUpperCase(), ko: "direct UDP (" + (n === "lan" ? "same network" : n === "wan" ? "internet" : "?") + ")" }; }
+    if (code === "peer-relay") return { kind: "peer-relay", label: "peer relay", ko: "peer relay (UDP relay)" };
+    if (code === "offline") return { kind: "offline", label: "offline", ko: "offline" };
+    return { kind: "none", label: "no path", ko: "no path" };
+  }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+  // ------------------------------------------------------------------ colours
+  var C = {};
+  function readColors() {
+    var cs = getComputedStyle(document.documentElement);
+    ["bg", "surface", "raised", "ink", "muted", "faint", "line", "line-strong", "grid", "up", "down", "rtt", "ok", "warn", "bad"].forEach(function (k) {
+      C[k.replace("-", "_")] = cs.getPropertyValue("--" + k).trim() || "#888";
+    });
+    C.font = cs.getPropertyValue("--font-sans").trim();
+    C.mono = cs.getPropertyValue("--font-mono").trim();
+  }
+
+  // ------------------------------------------------------------------ playback state
+  var play = { ph: 0, playing: !reduceMotion, speed: 1, win: 60, live: false, cross: null };
+  var lastPing = -1, lastProbeWall = 0;
+
+  // ------------------------------------------------------------------ link stage
+  var stage = { cv: $("link"), ctx: null, W: 0, H: 0, dpr: 1, G: null, key: "" };
+  stage.ctx = stage.cv.getContext("2d");
+  var lanes = { up: { parts: [], acc: 0 }, down: { parts: [], acc: 0 } };
+  var probes = [], ripples = [];
+
+  function cubic(p0, c1, c2, p1, n, out) {
+    for (var i = (out.length ? 1 : 0); i <= n; i++) {
+      var t = i / n, u = 1 - t;
+      out.push({ x: u * u * u * p0.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * p1.x,
+                 y: u * u * u * p0.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * p1.y });
+    }
+    return out;
+  }
+  function finishPath(pts) {
+    var s = 0; pts[0].s = 0;
+    for (var i = 1; i < pts.length; i++) { s += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y); pts[i].s = s; }
+    return { pts: pts, len: s };
+  }
+  function pointAt(path, f) {
+    var target = Math.max(0, Math.min(1, f)) * path.len, P = path.pts, lo = 0, hi = P.length - 1;
+    while (hi - lo > 1) { var m = (lo + hi) >> 1; if (P[m].s < target) lo = m; else hi = m; }
+    var a = P[lo], b = P[hi], seg = (b.s - a.s) || 1, k = (target - a.s) / seg;
+    var dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy) || 1;
+    return { x: a.x + dx * k, y: a.y + dy * k, nx: -dy / L, ny: dx / L, tx: dx / L, ty: dy / L };
+  }
+  function buildGeom(kind) {
+    var W = stage.W, H = stage.H, narrow = W < 520;
+    var r = narrow ? 20 : 26;
+    var S = { x: Math.max(narrow ? 40 : 70, W * 0.08), y: H * 0.46 };
+    var N = { x: W - S.x, y: S.y };
+    var sx = S.x + r + 4, nx = N.x - r - 4, span = nx - sx, off = 7;
+    var g = { S: S, N: N, r: r, narrow: narrow, relays: [], kind: kind };
+    if (kind === "derp") {
+      var rt = { x: sx + span * 0.66, y: H * 0.15 }, rb = { x: sx + span * 0.34, y: H * 0.80 };
+      var a0 = { x: sx, y: S.y - off }, a1 = { x: nx, y: N.y - off };
+      var up = cubic(a0, { x: a0.x + span * 0.22, y: a0.y }, { x: rt.x - span * 0.24, y: rt.y }, rt, 40, []);
+      cubic(rt, { x: rt.x + span * 0.14, y: rt.y }, { x: a1.x - span * 0.08, y: a1.y }, a1, 30, up);
+      var b0 = { x: nx, y: N.y + off }, b1 = { x: sx, y: S.y + off };
+      var dn = cubic(b0, { x: b0.x - span * 0.22, y: b0.y }, { x: rb.x + span * 0.24, y: rb.y }, rb, 40, []);
+      cubic(rb, { x: rb.x - span * 0.14, y: rb.y }, { x: b1.x + span * 0.08, y: b1.y }, b1, 30, dn);
+      g.up = finishPath(up); g.down = finishPath(dn);
+      g.relays = [{ x: rt.x, y: rt.y, which: "peer" }, { x: rb.x, y: rb.y, which: "self" }];
+    } else {
+      g.up = finishPath([{ x: sx, y: S.y - off }, { x: nx, y: N.y - off }]);
+      g.down = finishPath([{ x: nx, y: N.y + off }, { x: sx, y: S.y + off }]);
+      // densify straight lanes for pointAt
+      [g.up, g.down].forEach(function (p) { var a = p.pts[0], b = p.pts[1], pts = []; for (var i = 0; i <= 40; i++) pts.push({ x: a.x + (b.x - a.x) * i / 40, y: a.y + (b.y - a.y) * i / 40 }); var f = finishPath(pts); p.pts = f.pts; p.len = f.len; });
+      if (kind === "peer-relay") g.relays = [{ x: (sx + nx) / 2, y: S.y, which: "relay" }];
+    }
+    return g;
+  }
+  function resizeStage() {
+    var box = stage.cv.getBoundingClientRect();
+    var W = Math.max(260, box.width);
+    var H = Math.round(Math.max(220, Math.min(320, W * 0.32)));
+    stage.cv.style.height = H + "px";
+    stage.dpr = Math.min(2, window.devicePixelRatio || 1);
+    stage.cv.width = Math.round(W * stage.dpr); stage.cv.height = Math.round(H * stage.dpr);
+    stage.W = W; stage.H = H; stage.key = "";
+  }
+
+  function laneParams(r, dir) {
+    if (!r || !r.online) return { emit: 0, T: 3, rad: 2.4, est: false };
+    var Bps = dir === "up" ? r.up : r.down;
+    var pps = dir === "up" ? r.nout : r.nin, est = false;
+    if (pps == null && Bps != null) { pps = Bps / 900; est = true; }
+    var size = dir === "up" ? r.szOut : r.szIn;
+    var emit = (pps == null || pps <= 0) ? 0 : Math.min(40, 2 + 9 * Math.log10(1 + pps / 2));
+    var T = Bps == null ? 3.2 : Math.max(0.6, Math.min(4.2, 4.2 - 0.6 * Math.log10(1 + Bps)));
+    var rad = size == null ? 2.4 : 1.6 + 2.6 * Math.max(0, Math.min(1, size / 1280));
+    return { emit: emit, T: T, rad: rad, est: est };
+  }
+  function seedParticles() {
+    var r = rateAt(play.ph);
+    ["up", "down"].forEach(function (dir) {
+      var p = laneParams(r, dir), L = lanes[dir]; L.parts = []; L.acc = 0;
+      var n = Math.min(120, Math.floor(p.emit * p.T));
+      for (var i = 0; i < n; i++) L.parts.push({ f: (i + Math.random()) / n, r: p.rad, j: Math.random() - 0.5 });
+    });
+  }
+  function stepParticles(dtw, r) {
+    ["up", "down"].forEach(function (dir) {
+      var p = laneParams(r, dir), L = lanes[dir];
+      L.acc += dtw * p.emit;
+      while (L.acc >= 1) { L.acc -= 1; if (L.parts.length < 320) L.parts.push({ f: Math.random() * 0.02, r: p.rad, j: Math.random() - 0.5 }); }
+      var v = dtw / p.T;
+      for (var i = L.parts.length - 1; i >= 0; i--) { var q = L.parts[i]; q.f += v; if (q.f >= 1) L.parts.splice(i, 1); }
+    });
+    for (var k = probes.length - 1; k >= 0; k--) {
+      var pr = probes[k]; pr.age += dtw;
+      if (pr.age >= 1.0) { probes.splice(k, 1); ripples.push({ age: 0, rtt: pr.rtt, lost: pr.lost }); }
+    }
+    for (var m = ripples.length - 1; m >= 0; m--) { ripples[m].age += dtw; if (ripples[m].age > 1.4) ripples.splice(m, 1); }
+  }
+
+  function roundRect(ctx, x, y, w, h, rr) { ctx.beginPath(); ctx.moveTo(x + rr, y); ctx.arcTo(x + w, y, x + w, y + h, rr); ctx.arcTo(x + w, y + h, x, y + h, rr); ctx.arcTo(x, y + h, x, y, rr); ctx.arcTo(x, y, x + w, y, rr); ctx.closePath(); }
+  function strokePath(ctx, path) { ctx.beginPath(); path.pts.forEach(function (p, i) { if (i) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y); }); ctx.stroke(); }
+
+  function drawNode(ctx, g, at, name, place, kind, online) {
+    var r = g.r;
+    ctx.save();
+    ctx.globalAlpha = online ? 1 : 0.5;
+    ctx.fillStyle = C.bg; ctx.strokeStyle = C.line_strong; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(at.x, at.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // glyph: desktop = squat box with a front slot; laptop = screen + base
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 1.6; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    var s = r / 26;
+    if (kind !== "laptop") {
+      roundRect(ctx, at.x - 11 * s, at.y - 6 * s, 22 * s, 12 * s, 3 * s); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(at.x - 6 * s, at.y + 2 * s); ctx.lineTo(at.x - 1 * s, at.y + 2 * s); ctx.stroke();
+    } else {
+      roundRect(ctx, at.x - 9 * s, at.y - 9 * s, 18 * s, 12 * s, 2 * s); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(at.x - 13 * s, at.y + 6 * s); ctx.lineTo(at.x + 13 * s, at.y + 6 * s); ctx.stroke();
+    }
+    // status dot with surface ring
+    ctx.fillStyle = online ? C.ok : C.bad; ctx.strokeStyle = C.surface; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(at.x + r * 0.72, at.y - r * 0.72, 4.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ctx.fillStyle = C.ink; ctx.font = "600 " + (g.narrow ? 12 : 13) + "px " + C.font;
+    ctx.fillText(name, at.x, at.y + r + 8);
+    ctx.fillStyle = C.muted; ctx.font = "400 " + (g.narrow ? 11 : 12) + "px " + C.font;
+    ctx.fillText(place, at.x, at.y + r + (g.narrow ? 24 : 26));
+  }
+  function drawRelay(ctx, g, rl) {
+    var meta = store.meta || {}, code = rl.which === "peer" ? (meta.peer && meta.peer.home_derp) : rl.which === "self" ? (meta.self && meta.self.home_derp) : null;
+    var t1 = rl.which === "relay" ? "peer relay" : "DERP " + (code || "?");
+    var t2 = rl.which === "relay" ? "UDP relay" : (REGION[code] || "relay") + (rl.which === "self" ? " · inferred" : "");
+    ctx.font = "600 11px " + C.mono; var w1 = ctx.measureText(t1).width;
+    ctx.font = "400 10.5px " + C.font; var w2 = ctx.measureText(t2).width;
+    var w = Math.max(w1, w2) + 16, h = 34;
+    ctx.fillStyle = C.bg; ctx.strokeStyle = C.line_strong; ctx.lineWidth = 1;
+    roundRect(ctx, rl.x - w / 2, rl.y - h / 2, w, h, 6); ctx.fill(); ctx.stroke();
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = C.ink; ctx.font = "600 11px " + C.mono; ctx.fillText(t1, rl.x, rl.y - 7);
+    ctx.fillStyle = C.muted; ctx.font = "400 10.5px " + C.font; ctx.fillText(t2, rl.x, rl.y + 8);
+  }
+  function drawArrow(ctx, path, color) {
+    var p = pointAt(path, 0.985), q = pointAt(path, 0.94);
+    var dx = p.x - q.x, dy = p.y - q.y, L = Math.hypot(dx, dy) || 1; dx /= L; dy /= L;
+    ctx.fillStyle = color; ctx.beginPath();
+    ctx.moveTo(p.x + dx * 4, p.y + dy * 4);
+    ctx.lineTo(p.x - dx * 6 - dy * 5, p.y - dy * 6 + dx * 5);
+    ctx.lineTo(p.x - dx * 6 + dy * 5, p.y - dy * 6 - dx * 5);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function drawStage(r) {
+    var ctx = stage.ctx, W = stage.W, H = stage.H;
+    ctx.setTransform(stage.dpr, 0, 0, stage.dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    var info = pathInfo(r && r.path), kind = info.kind;
+    var gk = kind === "derp" ? "derp" : kind === "peer-relay" ? "peer-relay" : kind === "direct" ? "direct" : "flat";
+    var key = gk + "|" + W + "|" + H;
+    if (stage.key !== key) { stage.G = buildGeom(gk); stage.key = key; }
+    var g = stage.G, online = !!(r && r.online);
+    // lanes
+    [["up", C.up], ["down", C.down]].forEach(function (d) {
+      var path = g[d[0]];
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      if (online) {
+        ctx.strokeStyle = d[1]; ctx.globalAlpha = 0.10; ctx.lineWidth = 12; ctx.setLineDash([]); strokePath(ctx, path);
+        ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5; ctx.setLineDash(gk === "direct" ? [] : [6, 5]); strokePath(ctx, path);
+        ctx.setLineDash([]); ctx.globalAlpha = 0.9; drawArrow(ctx, path, d[1]);
+      } else {
+        ctx.strokeStyle = C.line_strong; ctx.globalAlpha = 1; ctx.lineWidth = 1.5; ctx.setLineDash([3, 6]); strokePath(ctx, path); ctx.setLineDash([]);
+      }
+      ctx.globalAlpha = 1;
+    });
+    // particles
+    if (online) {
+      [["up", C.up], ["down", C.down]].forEach(function (d) {
+        var path = g[d[0]]; ctx.fillStyle = d[1];
+        lanes[d[0]].parts.forEach(function (q) {
+          var p = pointAt(path, q.f), a = q.f < 0.06 ? q.f / 0.06 : q.f > 0.94 ? (1 - q.f) / 0.06 : 1;
+          ctx.globalAlpha = 0.9 * a;
+          ctx.beginPath(); ctx.arc(p.x + p.nx * q.j * 7, p.y + p.ny * q.j * 7, q.r, 0, Math.PI * 2); ctx.fill();
+        });
+      });
+      ctx.globalAlpha = 1;
+    }
+    // relay chips (above particles so labels stay legible)
+    g.relays.forEach(function (rl) { drawRelay(ctx, g, rl); });
+    // probes: out on the top lane, back on the bottom lane
+    probes.forEach(function (pr) {
+      var p = pr.age < 0.5 ? pointAt(g.up, pr.age / 0.5) : pointAt(g.down, (pr.age - 0.5) / 0.5);
+      if (pr.lost && pr.age >= 0.5) return;
+      ctx.fillStyle = C.bg; ctx.strokeStyle = pr.lost ? C.bad : C.rtt; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    });
+    // nodes
+    var meta = store.meta || {};
+    var ms_ = meta.self || {}, mp_ = meta.peer || {};
+    drawNode(ctx, g, g.S, ms_.name || "this machine", ms_.place || "", ms_.form || "desktop", true);
+    drawNode(ctx, g, g.N, mp_.name || "peer", mp_.place || "", mp_.form || "laptop", online);
+    // ripples + RTT label at this machine when a pong returns
+    ripples.forEach(function (rp) {
+      var k = Math.min(1, rp.age / 0.6);
+      if (k < 1) { ctx.strokeStyle = rp.lost ? C.bad : C.rtt; ctx.globalAlpha = 1 - k; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(g.S.x, g.S.y, g.r + 3 + k * 14, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1; }
+      var a = rp.age < 1.0 ? 1 : Math.max(0, 1 - (rp.age - 1.0) / 0.4);
+      ctx.globalAlpha = a; ctx.fillStyle = C.ink; ctx.font = "600 12px " + C.mono; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+      ctx.fillText(rp.lost ? "lost" : ms(rp.rtt) + " ms", g.S.x, g.S.y - g.r - 8);
+      ctx.globalAlpha = 1;
+    });
+    if (!online) {
+      ctx.fillStyle = C.muted; ctx.font = "500 12px " + C.font; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(kind === "offline" ? "peer offline · no flow" : "no path", W / 2, g.S.y - 22);
+    }
+  }
+
+  // ------------------------------------------------------------------ strips
+  function niceStep(raw) { if (!(raw > 0)) return 1; var p = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p; }
+  function decs(step) { return Math.max(0, Math.min(3, -Math.floor(Math.log10(step) + 1e-9))); }
+
+  function Strip(id, kind) {
+    this.cv = $(id); this.ctx = this.cv.getContext("2d"); this.kind = kind; this.ymax = null; this.W = 0; this.H = 0; this.dpr = 1;
+    var self = this;
+    this.cv.addEventListener("pointermove", function (e) { self.point(e); });
+    this.cv.addEventListener("pointerdown", function (e) { self.point(e); });
+    this.cv.addEventListener("pointerleave", function () { play.cross = null; });
+    this.cv.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        var v = view(); var base = play.cross == null ? Math.min(play.ph, v.t1) : play.cross;
+        play.cross = Math.max(v.t0, Math.min(Math.min(v.t1, play.ph), base + (e.key === "ArrowLeft" ? -1 : 1)));
+        tipSource = self;
+      } else if (e.key === "Escape") { play.cross = null; }
+    });
+    this.cv.addEventListener("blur", function () { play.cross = null; });
+  }
+  var tipSource = null;
+  Strip.prototype.resize = function () {
+    var b = this.cv.getBoundingClientRect(); this.dpr = Math.min(2, window.devicePixelRatio || 1);
+    this.W = Math.max(200, b.width); this.H = b.height || 120;
+    this.cv.width = Math.round(this.W * this.dpr); this.cv.height = Math.round(this.H * this.dpr);
+  };
+  Strip.prototype.box = function () { return { L: 4, R: this.W - (this.W < 420 ? 40 : 48), T: 8, B: this.H - 20 }; };
+  Strip.prototype.point = function (e) {
+    var rect = this.cv.getBoundingClientRect(), x = e.clientX - rect.left, bx = this.box(), v = view();
+    var t = v.t0 + (x - bx.L) / (bx.R - bx.L) * (v.t1 - v.t0);
+    play.cross = Math.max(v.t0, Math.min(v.t1, t)); tipSource = this;
+  };
+  function view() {
+    var a = tStart(), b = tEnd();
+    if (play.win > 0) { var t1 = Math.max(play.ph, a + Math.min(play.win, b - a)); return { t0: t1 - play.win, t1: t1 }; }
+    return { t0: a, t1: Math.max(b, a + 1) };
+  }
+  Strip.prototype.series = function () {
+    if (this.kind === "rate") return [{ k: "up", c: C.up, f: function (r) { return r.up == null ? null : r.up * 8 / 1e6; } }, { k: "down", c: C.down, f: function (r) { return r.down == null ? null : r.down * 8 / 1e6; } }];
+    if (this.kind === "pkt") return [{ k: "pout", c: C.up, f: function (r) { return r.nout != null ? r.nout : null; } }, { k: "pin", c: C.down, f: function (r) { return r.nin != null ? r.nin : null; } }];
+    return [];
+  };
+  Strip.prototype.draw = function () {
+    var ctx = this.ctx, W = this.W, H = this.H, bx = this.box(), v = view(), ph = play.ph, self = this;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+    var X = function (t) { return bx.L + (t - v.t0) / (v.t1 - v.t0) * (bx.R - bx.L); };
+    var R = store.rates, P = store.pings, vmax = 0, ser = this.series();
+    var lo = Math.max(0, bsearch(R, v.t0) - 1), hi = R.length - 1;
+    if (this.kind === "rtt") {
+      P.forEach(function (p) { if (p.t >= v.t0 - 2 && p.t <= v.t1) { vmax = Math.max(vmax, p.rtt || 0, (p.srtt || 0) + (p.rttvar || 0)); } });
+    } else {
+      for (var i = lo; i <= hi; i++) { if (R[i].t > v.t1 + 2) break; ser.forEach(function (s) { var y = s.f(R[i]); if (y != null) vmax = Math.max(vmax, y); }); }
+    }
+    var floor = this.kind === "rate" ? 0.05 : this.kind === "pkt" ? 10 : 50;
+    var step0 = niceStep(Math.max(vmax, floor) / 4), target = Math.ceil(Math.max(vmax, floor) * 1.08 / step0) * step0;
+    if (this.ymax == null || target > this.ymax) this.ymax = target; else this.ymax += (target - this.ymax) * 0.06;
+    var ymax = this.ymax, Y = function (y) { return bx.B - (y / ymax) * (bx.B - bx.T); };
+    // grid + y labels (right axis)
+    var step = niceStep(ymax / 4), d = decs(step);
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.fillStyle = C.muted; ctx.font = "400 10.5px " + C.mono; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    for (var y = 0; y <= ymax + 1e-9; y += step) {
+      var yy = Math.round(Y(y)) + 0.5; ctx.beginPath(); ctx.moveTo(bx.L, yy); ctx.lineTo(bx.R, yy); ctx.stroke();
+      ctx.fillText(y.toFixed(d), bx.R + 6, yy);
+    }
+    // baseline
+    ctx.strokeStyle = C.line_strong; ctx.beginPath(); ctx.moveTo(bx.L, Math.round(bx.B) + 0.5); ctx.lineTo(bx.R, Math.round(bx.B) + 0.5); ctx.stroke();
+    // x ticks
+    var span = v.t1 - v.t0, cands = [5, 10, 15, 30, 60, 120, 300, 600], ts = cands[cands.length - 1];
+    for (var c = 0; c < cands.length; c++) { if ((bx.R - bx.L) / (span / cands[c]) >= (W < 420 ? 64 : 76)) { ts = cands[c]; break; } }
+    ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = C.muted;
+    for (var tt = Math.ceil((v.t0 + TZ) / ts) * ts - TZ; tt <= v.t1; tt += ts) {
+      var xx = Math.round(X(tt)) + 0.5; if (xx < bx.L + 18 || xx > bx.R - 18) continue;
+      ctx.strokeStyle = C.grid; ctx.beginPath(); ctx.moveTo(xx, bx.T); ctx.lineTo(xx, bx.B); ctx.stroke();
+      ctx.fillText(fmtClock(tt), xx, bx.B + 5);
+    }
+    ctx.save(); ctx.beginPath(); ctx.rect(bx.L, 0, bx.R - bx.L + 7, H); ctx.clip();   // +7: end dots at the playhead keep their full ring
+    var drawUntil = play.win > 0 ? ph : v.t1;
+    if (this.kind === "rtt") {
+      var PP = P.filter(function (p) { return p.t >= v.t0 - 3 && p.t <= drawUntil; });
+      // band SRTT +- RTTVAR
+      var run = PP.filter(function (p) { return p.srtt != null && p.rttvar != null; });
+      if (run.length > 1) {
+        ctx.fillStyle = C.rtt; ctx.globalAlpha = 0.13; ctx.beginPath();
+        run.forEach(function (p, i) { var x = X(p.t), y = Y(Math.min(ymax, p.srtt + p.rttvar)); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+        for (var j = run.length - 1; j >= 0; j--) ctx.lineTo(X(run[j].t), Y(Math.max(0, run[j].srtt - run[j].rttvar)));
+        ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+        ctx.strokeStyle = C.rtt; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.beginPath();
+        run.forEach(function (p, i) { var x = X(p.t), y = Y(p.srtt); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+        ctx.stroke();
+      }
+      var dr = W < 520 ? 3 : 3.5;
+      PP.forEach(function (p) {
+        var x = X(p.t);
+        if (p.rtt == null) { ctx.strokeStyle = C.bad; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x - 4, bx.T + 2); ctx.lineTo(x + 4, bx.T + 10); ctx.moveTo(x + 4, bx.T + 2); ctx.lineTo(x - 4, bx.T + 10); ctx.stroke(); return; }
+        ctx.fillStyle = C.rtt; ctx.strokeStyle = C.bg; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(x, Y(Math.min(p.rtt, ymax)), dr, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      });
+    } else {
+      ser.forEach(function (s) {
+        var segs = [], cur = [];
+        for (var i = lo; i <= hi; i++) {
+          var r = R[i]; if (r.t > drawUntil + 0.001) break; if (r.t < v.t0 - 3) continue;
+          var y = s.f(r);
+          if (y == null || r.gap) { if (cur.length) segs.push(cur); cur = []; if (y == null) continue; }
+          cur.push([X(r.t), Y(Math.min(y, ymax))]);
+        }
+        if (cur.length) segs.push(cur);
+        segs.forEach(function (sg) {
+          if (sg.length < 2) return;
+          ctx.fillStyle = s.c; ctx.globalAlpha = 0.10; ctx.beginPath(); ctx.moveTo(sg[0][0], bx.B);
+          sg.forEach(function (p) { ctx.lineTo(p[0], p[1]); }); ctx.lineTo(sg[sg.length - 1][0], bx.B); ctx.closePath(); ctx.fill();
+          ctx.globalAlpha = 1; ctx.strokeStyle = s.c; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.beginPath();
+          sg.forEach(function (p, i) { if (i) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }); ctx.stroke();
+        });
+      });
+      if (play.win === 0) { // ghost the part after the playhead
+        ctx.fillStyle = C.bg; ctx.globalAlpha = 0.55; ctx.fillRect(X(ph), bx.T - 8, bx.R - X(ph), bx.B - bx.T + 8); ctx.globalAlpha = 1;
+      }
+      // end dots at the playhead
+      var rp = rateAt(ph);
+      if (rp) ser.forEach(function (s) { var y = s.f(rp); if (y == null) return; ctx.fillStyle = s.c; ctx.strokeStyle = C.bg; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(Math.min(ph, v.t1)), Y(Math.min(y, ymax)), 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); });
+    }
+    if (play.win === 0 && this.kind === "rtt") { ctx.fillStyle = C.bg; ctx.globalAlpha = 0.55; ctx.fillRect(X(ph), bx.T - 8, bx.R - X(ph), bx.B - bx.T + 8); ctx.globalAlpha = 1; }
+    // playhead (full view)
+    if (play.win === 0) { ctx.strokeStyle = C.ink; ctx.globalAlpha = 0.5; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(Math.round(X(ph)) + 0.5, bx.T - 4); ctx.lineTo(Math.round(X(ph)) + 0.5, bx.B); ctx.stroke(); ctx.globalAlpha = 1; }
+    // crosshair
+    if (play.cross != null) {
+      var cx = Math.round(X(play.cross)) + 0.5;
+      ctx.strokeStyle = C.ink; ctx.globalAlpha = 0.45; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, bx.T); ctx.lineTo(cx, bx.B); ctx.stroke(); ctx.globalAlpha = 1;
+      if (this.kind !== "rtt") {
+        var rc = rateAt(play.cross);
+        if (rc) ser.forEach(function (s) { var y = s.f(rc); if (y == null) return; ctx.fillStyle = s.c; ctx.strokeStyle = C.bg; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(rc.t), Y(Math.min(y, ymax)), 4.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); });
+      } else {
+        var pc = nearestPing(play.cross);
+        if (pc && pc.rtt != null) { ctx.fillStyle = C.rtt; ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(X(pc.t), Y(Math.min(pc.rtt, ymax)), 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+      }
+    }
+    ctx.restore();
+    // no data notice
+    if (this.kind === "pkt" && !R.some(function (r) { return r.nout != null; })) {
+      ctx.fillStyle = C.muted; ctx.font = "400 12px " + C.font; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("this source has no packet counters", (bx.L + bx.R) / 2, (bx.T + bx.B) / 2);
+    }
+  };
+  function nearestPing(t) {
+    var P = store.pings, i = bsearch(P, t), best = null;
+    [i, i + 1].forEach(function (k) { if (k >= 0 && k < P.length && Math.abs(P[k].t - t) <= 2 && (!best || Math.abs(P[k].t - t) < Math.abs(best.t - t))) best = P[k]; });
+    return best;
+  }
+
+  var strips = [new Strip("c-rate", "rate"), new Strip("c-pkt", "pkt"), new Strip("c-rtt", "rtt")];
+
+  // ------------------------------------------------------------------ tooltip
+  var tip = $("tip"), stripsBox = $("strips"), lastTipKey = "";
+  function updateTip() {
+    if (play.cross == null || !tipSource) { if (!tip.hidden) tip.hidden = true; lastTipKey = ""; return; }
+    var rc = rateAt(play.cross), pc = nearestPing(play.cross);
+    var key = (rc ? rc.t : "") + "|" + (pc ? pc.t : "") + "|" + tipSource.cv.id;
+    var host = stripsBox.getBoundingClientRect(), cr = tipSource.cv.getBoundingClientRect(), bx = tipSource.box(), v = view();
+    var x = cr.left - host.left + bx.L + (play.cross - v.t0) / (v.t1 - v.t0) * (bx.R - bx.L);
+    if (key !== lastTipKey) {
+      lastTipKey = key; tip.textContent = "";
+      tip.appendChild(el("div", "t", fmtClock(rc ? rc.t : play.cross)));
+      function row(color, cls, val, label) { var r = el("div", "row"); var k = el("i", cls); k.style.setProperty("--c", color); r.appendChild(k); r.appendChild(el("b", null, val)); r.appendChild(el("span", null, label)); tip.appendChild(r); }
+      if (rc) {
+        row("var(--up)", "lk", bitsTxt(rc.up), "sent");
+        row("var(--down)", "lk", bitsTxt(rc.down), "received");
+        row("var(--up)", "lk", rc.nout == null ? "—" : intc(rc.nout) + "/s", "packets sent");
+        row("var(--down)", "lk", rc.nin == null ? "—" : intc(rc.nin) + "/s", "packets received");
+      }
+      if (pc) row("var(--rtt)", "lk ring", pc.rtt == null ? "lost" : ms(pc.rtt) + " ms", "ping (SRTT " + ms(pc.srtt) + ")");
+      tip.appendChild(el("div", "muted", rc ? pathInfo(rc.path).ko : ""));
+    }
+    tip.hidden = false;
+    var tw = tip.offsetWidth, left = x + 14;
+    if (left + tw > host.width) left = x - tw - 14;
+    tip.style.left = Math.max(0, left) + "px";
+    tip.style.top = (cr.top - host.top + 4) + "px";
+  }
+
+  // ------------------------------------------------------------------ DOM readouts
+  function setVal(id, num, unit) { var e = $(id); e.textContent = num; if (unit) { var s = el("small", null, unit); e.appendChild(s); } }
+  function setSub(id, parts) { var e = $(id); e.textContent = ""; parts.forEach(function (p) { if (typeof p === "string") e.appendChild(document.createTextNode(p)); else e.appendChild(el("b", null, p.b)); }); }
+  function renderHeader() {
+    var o = overall(), meta = store.meta || {}, last = store.samples[store.samples.length - 1], info = pathInfo(last && last.path);
+    var chips = $("chips"); chips.textContent = "";
+    function chip(cls, bold, rest) { var c = el("span", "chip " + (cls || "")); if (cls) c.appendChild(el("i")); c.appendChild(el("b", null, bold)); if (rest) c.appendChild(document.createTextNode(rest)); chips.appendChild(c); }
+    chip(store.source === "live" ? "ok" : "", store.source === "live" ? "live" : "trace replay", store.source === "live" ? " " + store.srcLabel : (store.synthetic ? " · synthetic demo data" : ""));
+    var tone = info.kind === "direct" ? "ok" : info.kind === "derp" || info.kind === "peer-relay" ? "warn" : "bad";
+    chip(tone, info.kind === "derp" ? "DERP relay" : info.ko, info.kind === "derp" ? " · not direct · via " + (REGION[info.region] || info.region) : "");
+    var nm = function (x, d) { return (x && x.name) || d; };
+    $("title").textContent = nm(meta.self, "this machine") + " ↔ " + nm(meta.peer, "peer");
+    if (meta.tailscale_version) chip("", "Tailscale " + meta.tailscale_version, "");
+    var sm = $("summary"); sm.textContent = "";
+    function item(parts) { var s = el("span"); parts.forEach(function (p) { if (typeof p === "string") s.appendChild(document.createTextNode(p)); else s.appendChild(el("b", null, p.b)); }); sm.appendChild(s); }
+    item([store.source === "live" ? "buffer " : "trace ", { b: fmtClock(tStart()) + "–" + fmtClock(tEnd()) }, " · " + Math.round(o.span) + " s · every " + store.every + " s"]);
+    item(["sent mean ", { b: bitsTxt(o.upMean) }, " · peak ", { b: bitsTxt(o.upPeak) }]);
+    item(["received mean ", { b: bitsTxt(o.downMean) }, " · peak ", { b: bitsTxt(o.downPeak) }]);
+    item(["RTT p50 ", { b: ms(o.rttP50) + " ms" }, " · p95 ", { b: ms(o.rttP95) + " ms" }, " · max " + ms(o.rttMax) + " ms"]);
+    item(["lost ", { b: o.lost + "/" + o.pings }]);
+    var rec = store.recorded ? new Date((store.recorded.started_at + TZ) * 1000).toISOString().slice(0, 10) : "";
+    $("eyebrow").textContent = store.source === "live" ? "Tailscale tunnel · live" : "Tailscale tunnel · " + store.every + "-second trace replay" + (rec ? " · " + rec : "");
+    $("foot-src").textContent = store.source === "live" ? "Source: " + store.srcLabel + " (flow_collector.py serve)" :
+      "Source: " + (store.synthetic ? "synthetic trace (tools/make_synthetic_trace.py)" : "flow_collector.py record") + ", " + rec + " from " + fmtClock(tStart()) + ", " + Math.round(o.span) + " s, " + store.samples.length + " samples · " + store.pings.length + " pings. Errors: " + (Object.keys(store.errors || {}).length ? JSON.stringify(store.errors) : "none") + ".";
+    document.querySelectorAll(".hd-peer").forEach(function (e) { var c = meta.peer && meta.peer.home_derp; e.textContent = c ? c + " · " + (REGION[c] || c) : "—"; });
+    document.querySelectorAll(".hd-self").forEach(function (e) { var c = meta.self && meta.self.home_derp; e.textContent = c ? c + " · " + (REGION[c] || c) : "—"; });
+    $("m-oth").textContent = o.oth == null ? "not observed" : o.oth === 0 ? "0 bytes (all wire traffic belongs to this peer)" : bytes(o.oth);
+    $("speed").querySelectorAll("button").forEach(function (b) { b.disabled = store.source === "live"; });
+  }
+  function renderTiles() {
+    var ph = play.ph, r = rateAt(ph), last = store.samples[bsearch(store.samples, ph)] || store.samples[0];
+    if (!r) return;
+    var u = bits(r.up), d = bits(r.down);
+    setVal("v-up", u[0], u[1]); setVal("v-down", d[0], d[1]);
+    var lpu = laneParams(r, "up"), lpd = laneParams(r, "down");
+    setSub("s-up1", ["packets ", { b: r.nout == null ? "—" : intc(r.nout) + "/s" }, r.szOut ? " · avg " + intc(r.szOut) + " B" : (lpu.est ? " (estimated)" : "")]);
+    setSub("s-down1", ["packets ", { b: r.nin == null ? "—" : intc(r.nin) + "/s" }, r.szIn ? " · avg " + intc(r.szIn) + " B" : (lpd.est ? " (estimated)" : "")]);
+    var t0 = tStart();
+    setSub("s-up2", ["total so far ", { b: bytes((counterAt(ph, "tx") || 0) - (counterAt(t0, "tx") || 0)) }]);
+    setSub("s-down2", ["total so far ", { b: bytes((counterAt(ph, "rx") || 0) - (counterAt(t0, "rx") || 0)) }]);
+    var P = store.pings, pi = bsearch(P, ph), p = pi >= 0 ? P[pi] : null;
+    if (p) { if (p.rtt == null) setVal("v-rtt", "lost", ""); else setVal("v-rtt", String(ms(p.rtt)), "ms"); } else setVal("v-rtt", "—", "");
+    setSub("s-rtt1", ["SRTT ", { b: p ? ms(p.srtt) + " ms" : "—" }, " · jitter ", { b: p ? ms(p.rttvar) + " ms" : "—" }]);
+    var n = 0, lost = 0; for (var i = pi; i >= 0 && P[i].t > ph - 60; i--) { n++; if (P[i].rtt == null) lost++; }
+    setSub("s-rtt2", ["lost ", { b: lost + "/" + n }, " (last 60 s) · " + (p && p.via ? pathInfo(p.via).label : "")]);
+    var info = pathInfo(r.path);
+    setVal("v-path", info.label, "");
+    var meta = store.meta || {};
+    if (info.kind === "derp") setSub("s-path1", ["sent via ", { b: (meta.peer && meta.peer.home_derp) || info.region }, " · received via ", { b: (meta.self && meta.self.home_derp) || "?" }, " (inferred)"]);
+    else setSub("s-path1", [info.ko]);
+    var hsAge = last && last.hs ? Math.max(0, ph - last.hs) : null;
+    setSub("s-path2", ["handshake ", { b: hsAge == null ? "—" : Math.round(hsAge) + " s ago" }, last && last.tx != null ? " · total ↑" + bytes(last.tx) + " ↓" + bytes(last.rx) : ""]);
+    $("clock").textContent = fmtClock(ph) + " · " + Math.max(0, Math.round(ph - t0)) + "/" + Math.round(tEnd() - t0) + " s";
+    var sc = $("scrub"); if (document.activeElement !== sc) sc.value = String(Math.round((ph - t0) / Math.max(1, tEnd() - t0) * 1000));
+    stage.cv.setAttribute("aria-label", "Sent " + bitsTxt(r.up) + ", received " + bitsTxt(r.down) + ", " + info.ko + ", round trip " + (p && p.rtt != null ? ms(p.rtt) + " ms" : "not measured"));
+  }
+  function renderTable() {
+    var tb = $("tbody"); tb.textContent = ""; var frag = document.createDocumentFragment();
+    store.rates.forEach(function (r) {
+      var tr = document.createElement("tr"), pc = nearestPing(r.t);
+      [fmtClock(r.t), r.up == null ? "—" : intc(r.up * 8 / 1000), r.down == null ? "—" : intc(r.down * 8 / 1000), r.nout == null ? "—" : intc(r.nout), r.nin == null ? "—" : intc(r.nin),
+        (r.uout == null ? "—" : intc(r.uout)) + " / " + (r.uin == null ? "—" : intc(r.uin)), pathInfo(r.path).label, pc ? (pc.rtt == null ? "lost" : ms(pc.rtt)) : ""].forEach(function (v) { tr.appendChild(el("td", null, v)); });
+      frag.appendChild(tr);
+    });
+    tb.appendChild(frag);
+    $("tabledet").querySelector("summary").textContent = "Per-interval table (" + store.rates.length + " rows)";
+  }
+
+  // ------------------------------------------------------------------ controls
+  function setPlaying(v) {
+    play.playing = v;
+    var b = $("play"); b.setAttribute("aria-pressed", String(v));
+    $("playlabel").textContent = v ? "Pause" : "Play";
+    $("playicon").setAttribute("d", v ? "M4 2.5h3v11H4zM9 2.5h3v11H9z" : "M4.5 2.5v11l9-5.5z");
+  }
+  $("play").addEventListener("click", function () { setPlaying(!play.playing); });
+  function segInit(id, fn) {
+    var box = $(id);
+    box.addEventListener("click", function (e) {
+      var b = e.target.closest("button"); if (!b || b.disabled) return;
+      box.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+      fn(parseFloat(b.getAttribute("data-v")));
+    });
+  }
+  segInit("speed", function (v) { play.speed = v; });
+  segInit("win", function (v) { play.win = v; strips.forEach(function (s) { s.ymax = null; }); });
+  $("scrub").addEventListener("input", function (e) {
+    var t0 = tStart(); play.ph = t0 + parseFloat(e.target.value) / 1000 * (tEnd() - t0);
+    lastPing = bsearch(store.pings, play.ph); seedParticles(); renderTiles();
+  });
+
+  // ------------------------------------------------------------------ live mode
+  var params = {}; try { params = Object.fromEntries(new URLSearchParams(location.search)); } catch (e) { params = {}; }
+  var liveFirst = true;
+  function ingestFlow(doc) {
+    store.meta = doc.meta || store.meta; store.every = doc.every_s || 1; store.errors = doc.errors || {};
+    store.samples = trim(mergeByT(store.samples, normSamples(doc)), 900);
+    store.pings = trim(mergeByT(store.pings, normPings(doc)), 900);
+  }
+  function showBanner(text, bad) { var b = $("banner"); if (!text) { b.hidden = true; return; } b.textContent = text; b.className = "banner" + (bad ? " bad" : ""); b.hidden = false; }
+  function pollLive() {
+    var url;
+    try { url = new URL(params.src, location.href); } catch (e) { showBanner("Cannot parse the src address: " + params.src, true); return; }
+    if (store.liveKind === "flow" && store.samples.length && !liveFirst) url.searchParams.set("since", String(tEnd()));
+    fetch(url.toString(), { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(function (j) {
+      if (liveFirst && j && j.schema === "tsflow.v1" && (j.samples || []).length < 2) {
+        // flow_collector.py serve measures only while it is being polled: the first answers can be empty.
+        showBanner("Connected to the live source. Collecting the first samples; replaying the embedded trace meanwhile.");
+        setTimeout(pollLive, 1000); return;
+      }
+      if (liveFirst) { store.samples = []; store.pings = []; store.recorded = null; }
+      if (j && j.schema === "tsflow.v1") { store.liveKind = "flow"; ingestFlow(j); }
+      else throw new Error("unknown JSON format (expected schema tsflow.v1)");
+      computeRates();
+      if (liveFirst) { liveFirst = false; store.source = "live"; play.live = true; play.ph = Math.max(tStart(), tEnd() - 1); seedParticles(); }
+      renderHeader(); renderTiles(); showBanner("");
+      if ($("tabledet").open) renderTable();
+      setTimeout(pollLive, 1000);
+    }).catch(function (e) {
+      showBanner("Could not read the live source (" + (e && e.message ? e.message : e) + "). Retrying in 5 s." + (liveFirst ? " Replaying the embedded trace meanwhile." : ""), true);
+      setTimeout(pollLive, 5000);
+    });
+  }
+
+  // ------------------------------------------------------------------ boot
+  var doc = {};
+  try { doc = JSON.parse($("trace").textContent); } catch (e) { doc = {}; }
+  store.meta = doc.meta || {}; store.every = doc.every_s || 1; store.recorded = doc.recorded || null; store.errors = doc.errors || {}; store.synthetic = !!doc.synthetic;
+  store.samples = normSamples(doc); store.pings = normPings(doc);
+  computeRates();
+  var t0p = parseFloat(params.t);   // ?t=<seconds> starts the replay at that offset
+  play.ph = tStart() + (isFinite(t0p) ? Math.max(0, Math.min(t0p, tEnd() - tStart())) : (tEnd() - tStart() > 90 ? 60 : 0));
+  if (params.src) { store.srcLabel = params.src; showBanner("Connecting to live source: " + params.src); }
+
+  readColors();
+  function resizeAll() { resizeStage(); strips.forEach(function (s) { s.resize(); }); }
+  resizeAll(); seedParticles(); lastPing = bsearch(store.pings, play.ph);
+  renderHeader(); renderTiles(); setPlaying(play.playing);
+  $("tabledet").addEventListener("toggle", function () { if ($("tabledet").open) renderTable(); });
+  if (typeof ResizeObserver === "function") { var ro = new ResizeObserver(function () { resizeAll(); }); ro.observe(stage.cv.parentNode); ro.observe(stripsBox); }
+  else window.addEventListener("resize", resizeAll);
+  try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", readColors); } catch (e) { /* ignore */ }
+  new MutationObserver(readColors).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class"] });
+
+  var lastWall = performance.now();
+  function frame(now) {
+    var dtw = Math.min(0.1, Math.max(0, (now - lastWall) / 1000)); lastWall = now;
+    if (play.playing && store.rates.length) {
+      if (play.live) { var lt = tEnd(); play.ph = Math.min(lt, play.ph + dtw); if (lt - play.ph > 8) play.ph = lt - 1; }
+      else { play.ph += dtw * play.speed; if (play.ph > tEnd()) { play.ph = tStart(); lastPing = -1; } }
+      var pi = bsearch(store.pings, play.ph);
+      if (pi > lastPing) {
+        var p = store.pings[pi];
+        if (!reduceMotion && now - lastProbeWall > 350) { probes.push({ age: 0, rtt: p.rtt, lost: p.rtt == null }); lastProbeWall = now; }
+        lastPing = pi;
+      }
+    }
+    var r = rateAt(play.ph);
+    if (play.playing) stepParticles(dtw, r);
+    drawStage(r);
+    strips.forEach(function (s) { s.draw(); });
+    updateTip();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  setInterval(renderTiles, 200);   // text readouts on their own clock, independent of frame timing
+  if (params.src) pollLive();
+})();
+</script>
+</body>
+</html>
